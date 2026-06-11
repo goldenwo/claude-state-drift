@@ -26,6 +26,20 @@ anchored.
   - `/update-state` — draft a reviewed edit to `state.json` after meaningful progress.
   - `/re-anchor` — audit the current session against the objective and report drift.
 
+## What it looks like
+
+Every session opens with your project's actual state — not a cold start:
+
+```
+=== WHERE YOU ARE ===
+Project: my-api
+Version: 1.4.0 | Objective: Ship the v2 billing pipeline with usage-based invoicing
+Focus:   Webhook retry queue done; now wiring the invoice-preview endpoint
+In progress: invoice-preview-endpoint
+Deferred:    csv-export (until billing v2 ships)
+Recent: 3 commits today, last: "Add retry backoff to webhook queue"
+```
+
 ## Install
 
 ```
