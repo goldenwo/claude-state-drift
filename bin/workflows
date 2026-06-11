@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""workflows — cross-repo board view of all projects with .claude/state.json.
+
+Walks a configured root (default ~/dev/) for `.claude/state.json` files,
+renders each one's summary as a row in a single board:
+
+    REPO                  VERSION       FOCUS                          OPEN  BLOCK  AGE
+    claude-harness-toolkit 0.3.0-dev    Building state-tracking infra  2     0      4m
+    edge-catcher          0.7.2         hypothesis-driven loop ref...  3     1      2h
+    universal-memory      0.6           pre-promotion validation       0     0      1d
+
+Use `where-am-i <repo>` for full detail on any one project.
+
+Configuration: $WORKFLOWS_ROOT env var (default: $HOME/dev).
+Or edit ~/.claude/workflows-config.json (when implemented).
+
+Usage:
+    workflows                  # board view
+    workflows --root <path>    # walk this root instead
+    workflows --json           # machine-readable
+    workflows --depth N        # max recursion depth (default 2)
+    workflows --help
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from _state_lib import (  # noqa: E402
+    compute_lag_days,
+    parse_iso,
+    relative_age,
+    resolve_staleness_hours,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def get_root(arg_root: str | None) -> Path:
+    if arg_root:
+        return Path(arg_root).expanduser().resolve()
+    env = os.environ.get("WORKFLOWS_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.home() / "dev"
+
+
+def find_state_files(root: Path, max_depth: int = 2) -> list[Path]:
+    """Find all .claude/state.json under root, up to max_depth levels.
+
+    max_depth=2 finds:  root/<repo>/.claude/state.json
+    max_depth=3 finds:  root/<group>/<repo>/.claude/state.json (e.g. for ~/dev/work/<repo>)
+    """
+    results: list[Path] = []
+    if not root.is_dir():
+        return results
+
+    def walk(d: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(d.iterdir())
+        except (PermissionError, OSError):
+            return
+        for entry in entries:
+            if entry.is_dir():
+                state = entry / ".claude" / "state.json"
+                if state.is_file():
+                    results.append(state)
+                # Recurse only if no state.json found at this level (avoid descending into nested .claude/projects)
+                elif entry.name not in {".git", "node_modules", ".venv", "__pycache__", ".claude"}:
+                    walk(entry, depth + 1)
+
+    walk(root, 1)
+    return results
+
+
+def relative_age_short(iso_ts: str) -> str:
+    """Short-form age (`5h` / `2d` / `?`). Wraps `_state_lib.relative_age`."""
+    return relative_age(iso_ts, fmt="short")
+
+
+def truncate(s: str, n: int) -> str:
+    if len(s) <= n:
+        return s
+    return s[: n - 3] + "..."
+
+
+def compute_freshness(state: dict, repo_root: Path) -> str:
+    """Return a FRESHNESS string for one repo.
+
+    #25 (audit F13): surface per-repo state-drift-from-HEAD at a glance.
+    Reuses `_state_lib` primitives + the same STATE_STALENESS_HOURS /
+    STATE_STALENESS_DISABLE knobs as #23 (where-am-i) and #24 (statusline-
+    focus) so one env setting governs all three signals.
+
+    Returns:
+      'Nd stale' — lag exceeds threshold (N = integer days, ≥ 1)
+      'fresh'    — git present, last_updated parses AND is within threshold
+                   AND is not in the future relative to HEAD
+      '?'        — cannot compute or disabled: no .git, missing/malformed
+                   last_updated, future last_updated (state newer than HEAD),
+                   git invocation failure, STATE_STALENESS_DISABLE=1
+    """
+    PLACEHOLDER = "?"
+
+    if os.environ.get("STATE_STALENESS_DISABLE") == "1":
+        return PLACEHOLDER
+    if not (repo_root / ".git").exists():
+        return PLACEHOLDER
+
+    threshold_h = resolve_staleness_hours()
+
+    last_updated = state.get("last_updated")
+    if not isinstance(last_updated, str) or not last_updated:
+        return PLACEHOLDER
+
+    # Parse last_updated explicitly — if it fails, return placeholder.
+    # This distinguishes "malformed timestamp" from "genuinely fresh".
+    lu_dt = parse_iso(last_updated)
+    if lu_dt is None:
+        return PLACEHOLDER
+
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(repo_root), "log", "-1", "--format=%aI", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return PLACEHOLDER
+    if head.returncode != 0:
+        return PLACEHOLDER
+    head_iso = (head.stdout or "").strip()
+    if not head_iso:
+        return PLACEHOLDER
+
+    head_dt = parse_iso(head_iso)
+    if head_dt is None:
+        return PLACEHOLDER
+
+    # Future last_updated: state notably newer than HEAD → cannot compute
+    # cleanly. compute_lag_days clamps negative deltas to 0 and returns None,
+    # which would silently misreport a bad/future timestamp as "fresh".
+    # We allow up to 1 hour of clock skew (git stores commit times at 1s
+    # granularity while Python timestamps carry microseconds — a 0h-lag
+    # fixture will have lu_dt fractionally ahead of head_dt). Anything more
+    # than 1h in the future signals a genuinely bad timestamp → placeholder.
+    delta_h = (head_dt - lu_dt).total_seconds() / 3600  # positive = HEAD newer
+    if delta_h < -1:
+        return PLACEHOLDER
+
+    days = compute_lag_days(last_updated, head_iso, threshold_hours=threshold_h)
+    if days is None:
+        # lag_hours computed fine but is within the threshold → genuinely fresh
+        return "fresh"
+    return f"{days}d stale"
+
+
+def summarize_state(state_file: Path) -> dict:
+    """Extract a board-row dict from one state.json. Tolerant of malformed entries."""
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {
+            "repo": state_file.parent.parent.name,
+            "version": "(parse error)",
+            "focus": "",
+            "in_progress": 0,
+            "open": 0,
+            "blocked": 0,
+            "age": "?",
+            "freshness": "?",
+            "path": str(state_file.parent.parent),
+        }
+
+    # Type-guard: tolerate malformed state.json where collections are wrong type
+    raw_deliv = state.get("deliverables") or []
+    deliverables = [d for d in raw_deliv if isinstance(d, dict)] if isinstance(raw_deliv, list) else []
+    in_progress = sum(1 for d in deliverables if d.get("status") == "in_progress")
+    blocked_in_deliv = sum(1 for d in deliverables if d.get("status") == "blocked")
+    raw_blocked = state.get("blocked") or []
+    blocked_top = len([b for b in raw_blocked if isinstance(b, dict)]) if isinstance(raw_blocked, list) else 0
+    raw_q = state.get("open_questions") or []
+    open_q = sum(1 for q in raw_q if isinstance(q, dict) and not q.get("resolved_at")) if isinstance(raw_q, list) else 0
+
+    repo_root = state_file.parent.parent
+    return {
+        "repo": repo_root.name,
+        "version": state.get("version", "?"),
+        "focus": state.get("current_focus", ""),
+        "in_progress": in_progress,
+        "open": open_q,
+        "blocked": blocked_in_deliv + blocked_top,
+        "age": relative_age_short(state.get("last_updated", "")),
+        "freshness": compute_freshness(state, repo_root),
+        "path": str(repo_root),
+    }
+
+
+def render_board(rows: list[dict]) -> str:
+    if not rows:
+        return "(no .claude/state.json files found under the configured root)"
+
+    # Compute column widths from data, with min/max bounds
+    col_repo = max(len("REPO"), max(len(r["repo"]) for r in rows))
+    col_repo = min(col_repo, 28)
+    col_ver = max(len("VERSION"), max(len(r["version"]) for r in rows))
+    col_ver = min(col_ver, 14)
+    col_focus = 50  # fixed; truncate if longer
+
+    # FRESHNESS column width: longest of header + all values (min 7 = "FRESH  ")
+    col_fresh = max(len("FRESH"), max(len(r["freshness"]) for r in rows))
+    col_fresh = min(col_fresh, 14)
+
+    lines = []
+    header = (
+        f"{'REPO':<{col_repo}}  {'VERSION':<{col_ver}}  {'FOCUS':<{col_focus}}  "
+        f"IN  OPEN  BLOCK  AGE    {'FRESH':<{col_fresh}}"
+    )
+    lines.append("=== WORKFLOWS ===")
+    lines.append("")
+    lines.append(header)
+    lines.append("-" * len(header))
+    for r in rows:
+        lines.append(
+            f"{truncate(r['repo'], col_repo):<{col_repo}}  "
+            f"{truncate(r['version'], col_ver):<{col_ver}}  "
+            f"{truncate(r['focus'], col_focus):<{col_focus}}  "
+            f"{r['in_progress']:<2}  "
+            f"{r['open']:<4}  "
+            f"{r['blocked']:<5}  "
+            f"{r['age']:<7}"
+            f"{r['freshness']:<{col_fresh}}"
+        )
+    lines.append("")
+    lines.append(f"{len(rows)} repo(s) with state.json. Use `where-am-i <repo>` for detail.")
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("--help", "-h"):
+        print(__doc__)
+        return 0
+
+    json_mode = "--json" in argv
+    args = [a for a in argv if a != "--json"]
+
+    root_arg = None
+    depth = 2
+    i = 0
+    while i < len(args):
+        if args[i] == "--root" and i + 1 < len(args):
+            root_arg = args[i + 1]
+            i += 2
+        elif args[i] == "--depth" and i + 1 < len(args):
+            try:
+                depth = int(args[i + 1])
+            except ValueError:
+                print(f"workflows: invalid --depth value: {args[i + 1]}", file=sys.stderr)
+                return 2
+            i += 2
+        else:
+            print(f"workflows: unknown arg: {args[i]}", file=sys.stderr)
+            return 2
+
+    root = get_root(root_arg)
+    state_files = find_state_files(root, max_depth=depth)
+    rows = [summarize_state(f) for f in state_files]
+    rows.sort(key=lambda r: r["repo"].lower())
+
+    if json_mode:
+        print(json.dumps({"root": str(root), "repos": rows}, indent=2))
+    else:
+        print(f"Root: {root}")
+        print(render_board(rows))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

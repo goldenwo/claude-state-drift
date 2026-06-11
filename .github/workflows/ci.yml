@@ -1,0 +1,245 @@
+# GENERATED FILE — this workflow is emitted by the toolkit's build-public-plugin
+# ([SCAFFOLD]); hand-edits here will fail the regen-drift gate by design.
+# To change it: edit public-plugins/claude-state-drift/scaffold/.github/workflows/ci.yml
+# in the toolkit, then republish via bin/publish-public-plugin.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 11 * * 3"   # weekly: catches toolkit-clone/key rot + claude-CLI behavior drift
+
+jobs:
+  verify-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      cut_hash: ${{ steps.hash.outputs.cut_hash }}
+    steps:
+      - name: Checkout public tree
+        uses: actions/checkout@v6
+        with:
+          path: public
+
+      - name: Read pinned toolkit SHA from .build-provenance
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(sed -n 's/^toolkit_sha=//p' public/.build-provenance | tr -d '[:space:]')"
+          if ! printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "FAIL: toolkit_sha is not a full 40-hex SHA: '$sha' (branch/tag refs rejected)" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout toolkit at the pinned SHA (read-only deploy key)
+        uses: actions/checkout@v6
+        with:
+          repository: goldenwo/claude-harness-toolkit
+          ref: ${{ steps.pin.outputs.sha }}
+          ssh-key: ${{ secrets.TOOLKIT_DEPLOY_KEY }}
+          path: toolkit
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps (PyYAML for toolkit gates)
+        run: pip install pyyaml
+
+      - name: Install claude CLI
+        # BEFORE the smoke suites: clean-install-smoke's A1b runs the real
+        # `claude plugin validate` only when the CLI is on PATH — installing
+        # it later would silently skip A1b in CI (review R2-A1).
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: build-public-plugin self-test
+        shell: bash
+        working-directory: toolkit
+        run: python bin/build-public-plugin --test
+
+      - name: build-public-plugin --check (closure + allowlist + cut gates)
+        shell: bash
+        working-directory: toolkit
+        run: python bin/build-public-plugin --check
+
+      - name: regen-drift-gate self-test (planted-defect teeth)
+        shell: bash
+        working-directory: toolkit
+        run: python bin/regen-drift-gate --test
+
+      - name: REGENERATION-DRIFT GATE (rebuild from pin, diff vs committed tree)
+        shell: bash
+        working-directory: toolkit
+        run: python bin/regen-drift-gate ../public
+
+      - name: validate-cut self-test
+        shell: bash
+        working-directory: toolkit
+        run: bash bin/validate-cut --test
+
+      - name: Emitted-cut validation (suites re-rooted at the cut)
+        shell: bash
+        working-directory: toolkit
+        run: bash bin/validate-cut
+
+      - name: clean-install-smoke self-test
+        shell: bash
+        working-directory: toolkit
+        run: bash bin/clean-install-smoke --test
+
+      - name: Clean-install acceptance (fresh ~/.claude simulation)
+        shell: bash
+        working-directory: toolkit
+        run: bash bin/clean-install-smoke
+
+      - name: claude plugin validate (MANDATORY on the committed public tree)
+        shell: bash
+        run: claude plugin validate public
+
+      - name: Validate marketplace.json (committed public tree)
+        shell: bash
+        working-directory: toolkit
+        run: python bin/marketplace-validate ../public/.claude-plugin/marketplace.json
+
+      - name: Cut tree-hash (cross-platform determinism probe)
+        # MUST stay the LAST step of this job: gate-summary treats
+        # result=success as "hash was emitted after everything passed";
+        # reordering it earlier would let a later-failing leg leave a
+        # plausible hash behind (R2-B2 contract pin).
+        id: hash
+        shell: bash
+        working-directory: toolkit
+        run: |
+          set -euo pipefail
+          h="$(python bin/build-public-plugin --hash)"
+          echo "cut_hash=$h" >> "$GITHUB_OUTPUT"
+          echo "cut tree-hash: $h"
+
+  verify-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    outputs:
+      cut_hash: ${{ steps.hash.outputs.cut_hash }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout public tree
+        uses: actions/checkout@v6
+        with:
+          path: public
+
+      - name: Read pinned toolkit SHA from .build-provenance
+        id: pin
+        run: |
+          set -euo pipefail
+          sha="$(sed -n 's/^toolkit_sha=//p' public/.build-provenance | tr -d '[:space:]')"
+          if ! printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "FAIL: toolkit_sha is not a full 40-hex SHA: '$sha' (branch/tag refs rejected)" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout toolkit at the pinned SHA (read-only deploy key)
+        uses: actions/checkout@v6
+        with:
+          repository: goldenwo/claude-harness-toolkit
+          ref: ${{ steps.pin.outputs.sha }}
+          ssh-key: ${{ secrets.TOOLKIT_DEPLOY_KEY }}
+          path: toolkit
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps (PyYAML for toolkit gates)
+        run: pip install pyyaml
+
+      - name: Install claude CLI
+        # BEFORE the smoke suites — same A1b rationale as the linux leg (R2-A1).
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: build-public-plugin self-test
+        working-directory: toolkit
+        run: python bin/build-public-plugin --test
+
+      - name: build-public-plugin --check (closure + allowlist + cut gates)
+        working-directory: toolkit
+        run: python bin/build-public-plugin --check
+
+      - name: regen-drift-gate self-test (planted-defect teeth)
+        working-directory: toolkit
+        run: python bin/regen-drift-gate --test
+
+      - name: REGENERATION-DRIFT GATE (rebuild from pin, diff vs committed tree)
+        working-directory: toolkit
+        run: python bin/regen-drift-gate ../public
+
+      - name: validate-cut self-test
+        working-directory: toolkit
+        run: bash bin/validate-cut --test
+
+      - name: Emitted-cut validation (suites re-rooted at the cut)
+        working-directory: toolkit
+        run: bash bin/validate-cut
+
+      - name: clean-install-smoke self-test
+        working-directory: toolkit
+        run: bash bin/clean-install-smoke --test
+
+      - name: Clean-install acceptance (fresh ~/.claude simulation)
+        working-directory: toolkit
+        run: bash bin/clean-install-smoke
+
+      - name: claude plugin validate (MANDATORY on the committed public tree)
+        run: claude plugin validate public
+
+      - name: Validate marketplace.json (committed public tree)
+        working-directory: toolkit
+        run: python bin/marketplace-validate ../public/.claude-plugin/marketplace.json
+
+      - name: Cut tree-hash (cross-platform determinism probe)
+        # MUST stay the LAST step of this job: gate-summary treats
+        # result=success as "hash was emitted after everything passed";
+        # reordering it earlier would let a later-failing leg leave a
+        # plausible hash behind (R2-B2 contract pin).
+        id: hash
+        working-directory: toolkit
+        run: |
+          set -euo pipefail
+          h="$(python bin/build-public-plugin --hash)"
+          echo "cut_hash=$h" >> "$GITHUB_OUTPUT"
+          echo "cut tree-hash: $h"
+
+  gate-summary:
+    needs: [verify-linux, verify-windows]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail-closed verdict (every gate leg succeeded; tree-hashes match)
+        shell: bash
+        run: |
+          set -euo pipefail
+          lin="${{ needs.verify-linux.result }}"
+          win="${{ needs.verify-windows.result }}"
+          lh="${{ needs.verify-linux.outputs.cut_hash }}"
+          wh="${{ needs.verify-windows.outputs.cut_hash }}"
+          echo "linux=$lin windows=$win"
+          echo "linux-hash=${lh:-<missing>}"
+          echo "windows-hash=${wh:-<missing>}"
+          # Fail-closed: ANY result other than literal 'success' (skipped,
+          # cancelled, failure, missing job) is a publish blocker (spec §11.7).
+          [ "$lin" = "success" ] || { echo "FAIL-CLOSED: linux leg result=$lin" >&2; exit 1; }
+          [ "$win" = "success" ] || { echo "FAIL-CLOSED: windows leg result=$win" >&2; exit 1; }
+          [ -n "$lh" ] && [ -n "$wh" ] || { echo "FAIL-CLOSED: a tree-hash output is missing" >&2; exit 1; }
+          [ "$lh" = "$wh" ] || { echo "FAIL-CLOSED: cross-platform tree-hash mismatch (build is not byte-deterministic)" >&2; exit 1; }
+          echo "ALL GATES GREEN (fail-closed verified, build cross-platform deterministic)"

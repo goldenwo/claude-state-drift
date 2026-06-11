@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""state-lock — cross-platform exclusive lock for .claude/state.json writes.
+
+Phase M #63 (audit round-1 reviewer top-3 #2). Closes the gap where the
+focus-check counter has per-session locking (Phase K #58) but state.json
+writes themselves did not — two parallel Claude sessions running
+`update-state` against the same project could clobber each other.
+
+Lock-file path:
+   POSIX:   ${TMPDIR}/.claude-state-locks-<uid>/.claude-state-lock-<sha1[:12]>
+            per-uid dir @ 0700 + O_NOFOLLOW open (Sec P2-D / Phase O #74)
+   Windows: ${TMPDIR}/.claude-state-lock-<sha1[:12]>  (per-user %TEMP%)
+   - Per-project (different projects don't block each other)
+   - Stable across sessions (sha1 of canonical path)
+   - Lives in TMPDIR so cleanup is automatic on reboot
+
+Backends:
+   - POSIX: `fcntl.flock` (LOCK_EX)
+   - Windows: `msvcrt.locking` (LK_LOCK / LK_NBLCK)
+
+Modes:
+   state-lock with <project> -- <cmd> [args...]
+       Acquire lock, run cmd, release lock. cmd's exit code propagates.
+   state-lock try-acquire <project> [--timeout S]
+       Print "ACQUIRED" + exit 0 if obtainable within timeout; otherwise
+       "BUSY" + exit 1. Intended for tests + ad-hoc debugging.
+   state-lock --help
+
+Flags:
+   --reentrant   Same-owner re-entry. A plain nested `state-lock with`
+       against the SAME project self-deadlocks: the inner invocation is a
+       separate process whose own open-file-description cannot take the
+       LOCK_EX the outer already holds, so it blocks → times out for the
+       full --timeout (default 30s) then fails BUSY. With --reentrant the
+       owner stamps a PID-tagged sentinel into the lock file AND exports
+       its identity (CLAUDE_STATE_LOCK_OWNER) so a nested invocation that
+       inherits that env AND is a genuine DESCENDANT of the live holder
+       recognises "this lock is held by MY owner lineage" and treats the
+       acquire as same-owner re-entry: it skips the blocking acquire,
+       runs the inner command, and on exit does NOT release the outer
+       owner's lock ("I didn't acquire so I don't release"). Same-owner-
+       LINEAGE ONLY — a DIFFERENT process still blocks/serialises exactly
+       as before: no matching owner env, a dead owner PID, OR (#76
+       follow-up) a process that is NOT a descendant of the live holder
+       (e.g. a same-uid co-process that merely scraped the sentinel token
+       out of the advisory-locked, same-uid-readable lock file and
+       spoofed the env) is rejected — token-knowledge is necessary but
+       NOT sufficient, the process-ancestry bind is. Cross-process mutual
+       exclusion (this tool's whole purpose) is NOT weakened. Without
+       --reentrant, behaviour is byte-identical to #63 (default non-
+       reentrant; fully backward compatible). POSIX: the fcntl.flock
+       self-deadlock is fully avoided; the descendant check walks
+       /proc/<pid>/status PPid (fail-CLOSED on any ambiguity → normal
+       acquire, i.e. status-quo-ante since #76 is opt-in). Windows:
+       msvcrt.locking byte-range locks are likewise not reentrant and
+       would self-deadlock on a nested same-owner acquire — --reentrant
+       uses the SAME env+sentinel+ancestry detection there (ancestry via
+       CreateToolhelp32Snapshot, ctypes-only) to skip the re-lock, so it
+       strictly IMPROVES the nested case and never worsens Windows
+       (mirrors #74's POSIX-hardening / Windows-handled platform split).
+
+Used by:
+   skills/update-state — wraps its Edit operation in `state-lock with`
+   bin/focus-check-test — Section 18 parallel-write fixtures
+
+Exit codes:
+   passes through inner cmd exit code in `with` mode
+   1 BUSY in try-acquire mode (timeout exceeded)
+   2 arg / IO error
+
+Default timeout: 30 seconds (configurable via --timeout). State.json
+writes should be << 1 second; a 30-second wait indicates a stuck peer.
+"""
+
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+DEFAULT_TIMEOUT = 30.0
+POLL_INTERVAL = 0.05  # 50ms between non-blocking acquire retries
+
+# #76 reentrancy. Per-PROCESS identity token (uuid4().hex[:12] — same
+# idiom as #82's perf-bench RUN_TOKEN). On a --reentrant acquire the
+# owner writes `pid:<pid>:<RUN_TOKEN>` into the lock file AND exports
+# RUN_TOKEN via OWNER_ENV so child processes (the nested invocation)
+# inherit it. Same-owner re-entry requires the inherited env token to
+# equal the sentinel token, the sentinel PID to still be alive, AND
+# (#76 follow-up) THIS process to be a genuine DESCENDANT of that live
+# sentinel PID. The token alone is NOT a credential: it lives in a
+# same-uid-readable file (advisory flock does not gate reads), so a
+# co-process could scrape + spoof it — the descendant gate is what
+# actually binds reentry to the holder's lineage and preserves
+# cross-process exclusion (recycled-PID-safe: an exact live PID must
+# appear in our OWN ancestry).
+RUN_TOKEN = uuid.uuid4().hex[:12]
+OWNER_ENV = "CLAUDE_STATE_LOCK_OWNER"
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _try_acquire(handle) -> bool:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _release(handle) -> None:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+
+    def _try_acquire(handle) -> bool:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            return False
+
+    def _release(handle) -> None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+def _close_handle(handle) -> None:
+    """Defensive lock-handle close (mirrors _release's swallow-OSError).
+
+    #76/Windows: under --reentrant the nested invocation briefly opens
+    the lock file to read the sentinel; on Windows that transient share
+    can make the OUTER holder's close() raise PermissionError even though
+    the lock work is done. A close-time error must NEVER mask the inner
+    command's real exit code (the lock is already released by _release;
+    the FD is reclaimed at process exit regardless). POSIX close() does
+    not exhibit this; the guard is harmless there.
+    """
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+def _posix_lock_dir() -> Path:
+    """Phase O #74 (Sec P2-D): per-uid lock dir at mode 0700.
+
+    On POSIX, tempfile.gettempdir() is often a shared /tmp where a
+    co-located user can pre-create our lock files as symlinks or with
+    hostile perms. Confining locks to a 0700 dir we own — and verifying
+    ownership/mode if it already exists (os.lstat, so a symlink planted
+    AS the dir is itself caught) — removes that surface. Paired with
+    O_NOFOLLOW on the lock open (_open_lock_handle) for defense-in-depth.
+    """
+    d = Path(tempfile.gettempdir()) / f".claude-state-locks-{os.getuid()}"
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        info = os.lstat(d)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"lock dir is not a real directory (possible "
+                          f"symlink attack): {d}")
+        if info.st_uid != os.getuid():
+            raise OSError(f"lock dir not owned by current uid: {d}")
+        if info.st_mode & 0o077:
+            raise OSError(f"lock dir has unsafe permissions "
+                          f"{oct(info.st_mode & 0o777)}: {d}")
+    return d
+
+
+def lock_path_for(project_dir: Path) -> Path:
+    """Deterministic lock-file path keyed by project absolute path."""
+    canon = str(project_dir.resolve()).encode("utf-8")
+    digest = hashlib.sha1(canon).hexdigest()[:12]
+    if sys.platform == "win32":
+        # Windows %TEMP% is per-user under the profile — no shared-/tmp
+        # threat and no O_NOFOLLOW. Behaviour unchanged from #63.
+        return Path(tempfile.gettempdir()) / f".claude-state-lock-{digest}"
+    return _posix_lock_dir() / f".claude-state-lock-{digest}"
+
+
+def _open_lock_handle(lock_file: Path):
+    """Open the lock file for fcntl/msvcrt locking.
+
+    POSIX (#74): O_NOFOLLOW so a symlink pre-created at the lock path by a
+    co-located attacker is refused (ELOOP) rather than followed (which
+    would redirect the victim's lock onto an attacker-chosen file).
+    Windows: behaviour unchanged (per-user %TEMP%, no O_NOFOLLOW flag).
+    """
+    if sys.platform == "win32":
+        return lock_file.open("a+", encoding="utf-8")
+    fd = os.open(str(lock_file),
+                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    return os.fdopen(fd, "r+", encoding="utf-8")
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with `pid` currently exists.
+
+    Liveness guard for #76 reentrancy: a stale sentinel from a crashed
+    owner (or a recycled PID) must NOT be honoured as same-owner re-entry.
+    Paired with the OWNER_ENV token equality check (the primary guard) so
+    even a live but UNRELATED process holding the same PID is rejected.
+    """
+    try:
+        if sys.platform == "win32":
+            # No os.kill(0) on Windows; OpenProcess via ctypes is the
+            # portable liveness probe (PROCESS_QUERY_LIMITED_INFORMATION).
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        os.kill(pid, 0)
+        return True
+    except Exception:  # noqa: BLE001 — best-effort probe; never crash
+        # Fail-CLOSED: any uncertainty (ESRCH, EPERM, bad pid, ctypes
+        # quirk) ⇒ treat as NOT the live owner. Worst case is we miss a
+        # reentry and fall through to the normal acquire — always safe;
+        # the inverse (a false "alive") could skip a real lock.
+        return False
+
+
+_ANCESTRY_MAX_HOPS = 64  # process-tree depth cap (cycle / runaway guard)
+
+
+def _posix_parent_pid(pid: int):
+    """Parent PID of `pid` on POSIX, or None if it can't be read.
+
+    Prefer /proc/<pid>/status `PPid:` (stable, whitespace-delimited).
+    Fall back to field 4 of /proc/<pid>/stat, parsed AFTER the last ')'
+    so a comm containing spaces/parens (e.g. "(my proc)") can't shift
+    the field offsets. Any failure → None (caller fails CLOSED).
+    """
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8",
+                  errors="replace") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8",
+                  errors="replace") as fh:
+            data = fh.read()
+        # "pid (comm) state ppid ..." — comm may itself hold ') ' so we
+        # split on the LAST ')' and take the ppid as the 2nd token after.
+        after = data[data.rindex(")") + 1:].split()
+        return int(after[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _win_ppid_map():
+    """pid→ppid map for every process, via CreateToolhelp32Snapshot.
+
+    Dependency-free (ctypes only — no psutil). Returns {} on any failure
+    so the caller fails CLOSED (treats lineage as unprovable → normal
+    acquire). Reentry is rare / not a hot path, so a full snapshot per
+    call is acceptable.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID:
+        return {}
+    mapping = {}
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if not k32.Process32First(snap, ctypes.byref(entry)):
+            return {}
+        while True:
+            mapping[int(entry.th32ProcessID)] = \
+                int(entry.th32ParentProcessID)
+            if not k32.Process32Next(snap, ctypes.byref(entry)):
+                break
+    finally:
+        k32.CloseHandle(snap)
+    return mapping
+
+
+def _is_descendant_of(target_pid: int) -> bool:
+    """True iff THIS process's ancestry chain reaches `target_pid`.
+
+    The #76-follow-up lineage gate. Token-match alone is forgeable: the
+    sentinel token lives in a same-uid-readable file (POSIX: the 0600
+    lock file; Windows: the .owner sidecar) and fcntl.flock is ADVISORY
+    (a reader needs no lock to read it), so any same-uid co-process can
+    scrape the token and spoof CLAUDE_STATE_LOCK_OWNER. Genuine reentry,
+    by construction, comes from a process the holder SPAWNED — i.e. a
+    descendant. We therefore require the requester's parent-chain to
+    include the EXACT live sentinel PID; a non-descendant attacker that
+    merely knows the token cannot forge an ancestry link.
+
+    Fails CLOSED: any unreadable /proc, broken/cyclic chain, hop-cap
+    hit, or ctypes quirk → False → caller does a NORMAL blocking
+    acquire. That is always safe: the worst case is a legitimate deep
+    nest blocking exactly as it did BEFORE #76 existed (#76 is opt-in /
+    default-OFF, so failing closed is status-quo-ante, not a regression
+    this fix introduces). Recycled-PID note: requiring an EXACT live PID
+    *in our own ancestry* (not just "a live PID with a matching token")
+    means a recycled PID can't be honoured — if an intermediate ancestor
+    died and we were reparented (typically to PID 1 / a subreaper), the
+    chain no longer reaches target_pid and we correctly fail closed.
+    """
+    if target_pid <= 1:
+        return False
+    try:
+        if sys.platform == "win32":
+            ppids = _win_ppid_map()
+            if not ppids:
+                return False
+            cur = os.getpid()
+            seen = set()
+            for _ in range(_ANCESTRY_MAX_HOPS):
+                if cur == target_pid:
+                    return True
+                if cur <= 0 or cur in seen:
+                    return False
+                seen.add(cur)
+                nxt = ppids.get(cur)
+                if nxt is None or nxt == cur:
+                    return False
+                cur = nxt
+            return False
+        cur = os.getpid()
+        seen = set()
+        for _ in range(_ANCESTRY_MAX_HOPS):
+            if cur == target_pid:
+                return True
+            if cur <= 1 or cur in seen:
+                return False
+            seen.add(cur)
+            nxt = _posix_parent_pid(cur)
+            if nxt is None or nxt == cur:
+                return False
+            cur = nxt
+        return False
+    except Exception:  # noqa: BLE001 — fail CLOSED on ANY ambiguity
+        return False
+
+
+def _sentinel_path(lock_file: Path) -> Path:
+    """Windows-only: sidecar owner-file path next to the lock file (#76).
+
+    Why a sidecar on Windows but in-file on POSIX (a #74-style platform
+    split): `msvcrt.locking` is a POSITIONAL byte-range lock. Writing the
+    sentinel into the locked file means seek/truncate/write, which moves
+    the C-runtime file pointer and frees/relocates the very byte msvcrt
+    locked — a DIFFERENT process then acquires immediately (cross-process
+    mutual exclusion, this tool's whole purpose, would be silently
+    broken). POSIX `fcntl.flock` locks the open-file-description (whole
+    fd, position-independent), so an in-file write there is harmless and
+    matches the spec literally. On Windows we therefore leave the locked
+    file's bytes 100% untouched (the #63/#74 lock path is byte-identical)
+    and put the advisory sentinel in `<lockfile>.owner`. That name still
+    matches the `.claude-state-lock-*` cleanup glob in
+    session-start-orient.sh (the `*` covers the `.owner` suffix) — no new
+    litter class. The sentinel is advisory only; the OS lock stays
+    authoritative.
+    """
+    return lock_file.with_name(lock_file.name + ".owner")
+
+
+def _write_owner_sentinel(handle, lock_file: Path) -> None:
+    """Record `pid:<pid>:<RUN_TOKEN>` for same-owner reentry (#76).
+
+    Called ONLY after the flock/msvcrt lock is held → no race with a
+    concurrent owner. Best-effort: a write failure must not break locking
+    (the sentinel is a reentrancy-detection optimisation, NOT a
+    correctness primitive — the OS lock is authoritative). POSIX: written
+    into the locked file via the already-open #74 O_NOFOLLOW fd (no path
+    re-resolution). Windows: written to the sidecar (see _sentinel_path —
+    keeps the msvcrt-locked file's bytes untouched).
+    """
+    payload = f"pid:{os.getpid()}:{RUN_TOKEN}\n"
+    try:
+        if sys.platform == "win32":
+            _sentinel_path(lock_file).write_text(payload, encoding="utf-8")
+        else:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(payload)
+            handle.flush()
+    except OSError:
+        pass
+
+
+def _clear_owner_sentinel(handle, lock_file: Path) -> None:
+    """Erase the owner sentinel on release (#76 — correctness, not litter).
+
+    MUST run while the OS lock is STILL held (before _release) so there is
+    no race with another owner. Only the true OUTER acquirer reaches this
+    (the reentry fast-path returns before the finally and never wrote a
+    sentinel). Erasing it guarantees the advisory sentinel never OUTLIVES
+    the held lock: otherwise an outer that releases but stays alive (env
+    still set) could let a later same-lineage --reentrant child short-
+    circuit a lock that is no longer held → it would run WITHOUT mutual
+    exclusion. With the sentinel cleared on release, is_same_owner_reentry
+    can only ever fire while the lock is genuinely held. Best-effort.
+    POSIX: truncate via the held #74 O_NOFOLLOW fd. Windows: unlink the
+    sidecar (advisory file; the msvcrt-locked file is untouched).
+    """
+    try:
+        if sys.platform == "win32":
+            _sentinel_path(lock_file).unlink()
+        else:
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+    except OSError:
+        pass
+
+
+def _read_owner_sentinel(lock_file: Path):
+    """Return (pid, token) from the owner sentinel, or None.
+
+    POSIX reads the locked file itself with O_NOFOLLOW (#74 symlink
+    defense preserved — a planted symlink at the lock path is never
+    followed). Windows reads the sidecar. A missing/empty/malformed
+    sentinel → None: the caller then takes the normal blocking-acquire
+    path. Reentrancy detection only ever SHORT-CIRCUITS; it must never
+    PREVENT a legitimate acquire.
+    """
+    try:
+        if sys.platform == "win32":
+            # `with` closes the read handle before we return — a lingering
+            # open handle on a file the outer still has under an msvcrt
+            # lock can make the outer's later close()/unlock hit a Windows
+            # sharing-violation. (Sidecar is unlocked, but be uniform.)
+            with _sentinel_path(lock_file).open(
+                    "r", encoding="utf-8") as fh:
+                line = fh.readline()
+        else:
+            fd = os.open(str(lock_file), os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                line = fh.readline()
+    except OSError:
+        return None
+    parts = line.strip().split(":")
+    if len(parts) != 3 or parts[0] != "pid":
+        return None
+    try:
+        return int(parts[1]), parts[2]
+    except ValueError:
+        return None
+
+
+def is_same_owner_reentry(lock_file: Path) -> bool:
+    """True iff the lock is held by THIS invocation's owner lineage (#76).
+
+    Same-owner re-entry requires ALL of:
+      1. OWNER_ENV is set in our environment (an outer --reentrant holder
+         exported it; subprocess inherits env by default), AND
+      2. the lock file's sentinel token == that inherited env token, AND
+      3. the sentinel PID is still alive, AND
+      4. (#76 follow-up — CRITICAL) THIS process is a genuine DESCENDANT
+         of that live sentinel PID.
+
+    (1)+(2)+(3) are necessary but NOT sufficient: the sentinel token is
+    stored in a same-uid-readable file (POSIX: the 0600 lock file;
+    Windows: the .owner sidecar) and fcntl.flock is ADVISORY, so any
+    same-uid co-process can read the live token and spoof OWNER_ENV
+    WITHOUT being related to the holder. "Knows the token" must NOT
+    equal "may reenter". (4) is the binding gate: genuine reentry only
+    ever originates from a process the holder SPAWNED (a descendant); a
+    non-descendant attacker cannot forge an ancestry link to the exact
+    live holder PID. Token-match stays as the cheap pre-filter (and
+    still gives recycled-PID safety on its own); the ancestry check
+    closes the forge bypass. _is_descendant_of fails CLOSED, so any
+    ambiguity → normal blocking acquire (safe; see its docstring). A
+    DIFFERENT process is therefore NEVER seen as the owner →
+    cross-process mutual exclusion is preserved; this only collapses
+    TRUE same-owner (genuinely nested) re-entry.
+    """
+    env_token = os.environ.get(OWNER_ENV)
+    if not env_token:
+        return False
+    sentinel = _read_owner_sentinel(lock_file)
+    if sentinel is None:
+        return False
+    pid, token = sentinel
+    if token != env_token or not _pid_alive(pid):
+        return False
+    return _is_descendant_of(pid)
+
+
+def acquire_with_timeout(lock_file: Path, timeout: float):
+    """Block until lock acquired or timeout. Return open handle or None."""
+    try:
+        handle = _open_lock_handle(lock_file)
+    except OSError as e:
+        print(f"state-lock: refusing to open lock file (possible symlink "
+              f"attack): {lock_file}: {e}", file=sys.stderr)
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        if _try_acquire(handle):
+            return handle
+        if time.monotonic() >= deadline:
+            handle.close()
+            return None
+        time.sleep(POLL_INTERVAL)
+
+
+def cmd_with(project: str, inner_cmd: list[str], timeout: float,
+             reentrant: bool = False) -> int:
+    project_dir = Path(project).expanduser().resolve()
+    if not project_dir.is_dir():
+        print(f"state-lock: project dir does not exist: {project_dir}",
+              file=sys.stderr)
+        return 2
+    try:
+        lock_file = lock_path_for(project_dir)
+    except OSError as e:
+        print(f"state-lock: refusing to lock — {e}", file=sys.stderr)
+        return 2
+
+    # #76: same-owner re-entry — the lock is already held by THIS owner
+    # lineage (env token + live sentinel PID). Skip the blocking acquire
+    # (which would self-deadlock for the full timeout); run the inner
+    # command WITHOUT a handle so the finally-block does NOT release the
+    # OUTER holder's lock ("I didn't acquire so I don't release").
+    if reentrant and is_same_owner_reentry(lock_file):
+        try:
+            proc = subprocess.run(inner_cmd)
+            return proc.returncode
+        except FileNotFoundError:
+            print(f"state-lock: inner command not found: {inner_cmd[0]}",
+                  file=sys.stderr)
+            return 2
+
+    handle = acquire_with_timeout(lock_file, timeout)
+    if handle is None:
+        print(f"state-lock: BUSY — timed out after {timeout}s waiting for "
+              f"{lock_file}. A peer process may be holding the lock; "
+              f"check for stuck `update-state` invocations.",
+              file=sys.stderr)
+        return 1
+    if reentrant:
+        # We are the OUTER holder: stamp our identity (POSIX: in the
+        # locked file; Windows: sidecar) and export it so a nested
+        # invocation that inherits this env recognises same-owner
+        # re-entry. Only meaningful under --reentrant.
+        _write_owner_sentinel(handle, lock_file)
+        os.environ[OWNER_ENV] = RUN_TOKEN
+    try:
+        proc = subprocess.run(inner_cmd)
+        return proc.returncode
+    except FileNotFoundError:
+        print(f"state-lock: inner command not found: {inner_cmd[0]}",
+              file=sys.stderr)
+        return 2
+    finally:
+        if reentrant:
+            # Clear our advisory sentinel while we STILL hold the lock
+            # (before _release → no race). Only the OUTER acquirer is
+            # here; the reentry fast-path returned earlier and wrote
+            # nothing. Keeps the sentinel from ever outliving the lock.
+            _clear_owner_sentinel(handle, lock_file)
+        _release(handle)
+        _close_handle(handle)
+        # Phase Q C-new-3 (round-4 reviewer): the Phase P F5 unlink was
+        # WRONG on POSIX. fcntl.flock keys on the open-file-description.
+        # If process A unlinks after release while process B holds the
+        # lock on the orphaned inode AND process C then creates a fresh
+        # file and acquires its own lock, BOTH B and C believe they own
+        # the lock for this project — a correctness violation. So we do
+        # NOT unlink. The lock files (~12 bytes each, one per distinct
+        # project ever locked) are swept by hooks/session-start-orient.sh's
+        # >7-day cleanup glob — Phase R #7 added `.claude-state-lock-*`
+        # (flat, Windows) and Phase O #74 added the POSIX per-uid subdir
+        # `.claude-state-locks-<uid>/.claude-state-lock-*` to that glob.
+        # DO NOT re-add unlink here without switching to fcntl.lockf
+        # semantics.
+
+
+def cmd_try_acquire(project: str, timeout: float,
+                    reentrant: bool = False) -> int:
+    project_dir = Path(project).expanduser().resolve()
+    if not project_dir.is_dir():
+        print(f"state-lock: project dir does not exist: {project_dir}",
+              file=sys.stderr)
+        return 2
+    try:
+        lock_file = lock_path_for(project_dir)
+    except OSError as e:
+        print(f"state-lock: refusing to lock — {e}", file=sys.stderr)
+        return 2
+    # #76: same-owner re-entry — the owner already holds it; report
+    # ACQUIRED immediately without blocking or releasing (a no-op hold).
+    if reentrant and is_same_owner_reentry(lock_file):
+        print("ACQUIRED")
+        return 0
+    handle = acquire_with_timeout(lock_file, timeout)
+    if handle is None:
+        print("BUSY")
+        return 1
+    print("ACQUIRED")
+    # Hold the lock until stdin closes — useful for test fixtures that
+    # spawn this process in the background and want to verify a peer
+    # waits. The caller can kill -SIGTERM to release.
+    try:
+        sys.stdin.read()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _release(handle)
+        _close_handle(handle)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("--help", "-h"):
+        print(__doc__)
+        return 0
+
+    mode = argv[0]
+    args = argv[1:]
+
+    # Split at the FIRST bare `--` BEFORE flag-parsing. state-lock's own
+    # flags (--timeout / --reentrant) are only ever the outer invocation's;
+    # everything after `--` is the inner command and MUST pass through
+    # verbatim. (#76: the prior parser scanned the whole list, so a nested
+    # `state-lock with P --reentrant -- state-lock with P --reentrant -- X`
+    # had the OUTER eat BOTH --reentrant/--timeout tokens — the inner then
+    # ran non-reentrant and self-deadlocked, defeating this very fix. The
+    # inner segment is left untouched; existing call sites that never put
+    # state-lock flags after `--` are byte-unaffected.)
+    if "--" in args:
+        sep_idx = args.index("--")
+        flag_args = args[:sep_idx]
+        inner_args = args[sep_idx:]  # includes the "--" itself
+    else:
+        flag_args = args
+        inner_args = []
+
+    # Parse --timeout / --reentrant (leading flags only, pre-`--`).
+    timeout = DEFAULT_TIMEOUT
+    reentrant = False
+    pruned: list[str] = []
+    i = 0
+    while i < len(flag_args):
+        if flag_args[i] == "--timeout" and i + 1 < len(flag_args):
+            try:
+                timeout = float(flag_args[i + 1])
+            except ValueError:
+                print(f"state-lock: invalid --timeout: {flag_args[i + 1]}",
+                      file=sys.stderr)
+                return 2
+            i += 2
+        elif flag_args[i] == "--reentrant":
+            reentrant = True
+            i += 1
+        else:
+            pruned.append(flag_args[i])
+            i += 1
+    args = pruned + inner_args
+
+    if mode == "with":
+        if "--" not in args:
+            print("state-lock: 'with' mode requires `--` separator before "
+                  "inner command. Example: state-lock with /path -- bash -c 'echo'",
+                  file=sys.stderr)
+            return 2
+        sep_idx = args.index("--")
+        if sep_idx != 1 or len(args) <= sep_idx + 1:
+            print("state-lock: 'with' usage: state-lock with <project> -- <cmd>...",
+                  file=sys.stderr)
+            return 2
+        project = args[0]
+        inner = args[sep_idx + 1:]
+        return cmd_with(project, inner, timeout, reentrant)
+
+    if mode == "try-acquire":
+        if len(args) != 1:
+            print("state-lock: 'try-acquire' usage: state-lock try-acquire <project>",
+                  file=sys.stderr)
+            return 2
+        return cmd_try_acquire(args[0], timeout, reentrant)
+
+    print(f"state-lock: unknown mode '{mode}'. See --help.", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

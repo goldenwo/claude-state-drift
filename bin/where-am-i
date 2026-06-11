@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""where-am-i — orientation block for the current project.
+
+Reads <project>/.claude/state.json (per SCHEMA.md
+schema), recent git log, and recent snapshot-spec entries. Prints a
+"WHERE YOU ARE" block: current objective + version + focus, in-progress
+deliverables, deferred-for-this-version vs deferred-for-later, blocked,
+open questions, last commits, last snapshot.
+
+Silent skip if .claude/state.json doesn't exist (no enforcement).
+
+Usage:
+    where-am-i              # uses $CLAUDE_PROJECT_DIR or pwd
+    where-am-i /path/to/repo
+    where-am-i --json       # raw state.json passthrough
+    where-am-i --history <id>   # #67: append-only transition log for a deliverable
+    where-am-i --help
+
+Schema (SCHEMA.md is canonical):
+    .claude/state.json = {
+        objective:         str,
+        objective_set_at:  str (ISO date),
+        version:           str (current target),
+        current_focus:     str,
+        deliverables: [
+            {id, title, status: done|in_progress|deferred|blocked,
+             version: str|null, started_at?, completed_at?,
+             deferred_reason?, blocked_on?}
+        ],
+        blocked: [{id, title, blocked_on, since}],
+        open_questions: [{q, asked_at, resolved_at?, resolution?}],
+        last_updated: str (ISO timestamp)
+    }
+
+Invariants enforced (best-effort warnings, not hard fails):
+- deferred deliverables MUST have deferred_reason
+- blocked entries MUST have blocked_on
+- last_updated is auto-printed as relative-age
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from _state_lib import (  # noqa: E402
+    compute_lag_days,
+    history_path,
+    normalize_version,
+    read_history,
+    relative_age as _relative_age,
+    resolve_staleness_hours,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def relative_age(iso_ts: str) -> str:
+    """Wraps `_state_lib.relative_age` in 'long' format ('5h ago' / 'unknown')."""
+    return _relative_age(iso_ts, fmt="long")
+
+
+def project_root(arg: str | None) -> Path:
+    if arg:
+        return Path(arg).resolve()
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env:
+        return Path(env).resolve()
+    return Path.cwd()
+
+
+def load_state(root: Path) -> dict | None:
+    f = root / ".claude" / "state.json"
+    if not f.is_file():
+        return None
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"where-am-i: failed to parse {f}: {e}", file=sys.stderr)
+        return None
+
+
+def git_log(root: Path, n: int = 5) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "log", f"-{n}", "--oneline"],
+            capture_output=True, text=True, timeout=5
+        )
+        return [line for line in out.stdout.splitlines() if line.strip()]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+
+
+def compute_staleness(state: dict, root: Path) -> tuple[int, int] | None:
+    """Return (lag_days, commits_ahead) if state is stale beyond threshold, else None.
+
+    #23 (audit F5 / F14): surface state-drift-from-HEAD in the orient block.
+    Reuses the #24 statusline machinery for consistency — the same
+    STATE_STALENESS_HOURS (threshold) / STATE_STALENESS_DISABLE (kill switch)
+    env knobs and the `_state_lib.compute_lag_days` calculator (one place for
+    the ISO-parse + lag math). `commits_ahead` is the count of commits whose
+    commit-date is after `last_updated` (`git rev-list --count --since`), i.e.
+    how many commits have landed since state was last touched.
+
+    Silent-skip (returns None) on any of: STATE_STALENESS_DISABLE=1, missing
+    .git, missing/malformed/future last_updated, git invocation failure, lag
+    at-or-below threshold. The orient block then renders without the line —
+    uninstrumented / fresh / non-git projects pay nothing.
+    """
+    if os.environ.get("STATE_STALENESS_DISABLE") == "1":
+        return None
+    if not (root / ".git").exists():
+        return None
+
+    threshold_h = resolve_staleness_hours()
+
+    last_updated = state.get("last_updated")
+    if not isinstance(last_updated, str) or not last_updated:
+        return None
+
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%aI", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None
+    if head.returncode != 0:
+        return None
+    head_iso = (head.stdout or "").strip()
+    if not head_iso:
+        return None
+
+    days = compute_lag_days(last_updated, head_iso, threshold_hours=threshold_h)
+    if days is None:
+        return None
+
+    # Commits landed since last_updated. `--since` reads the same ISO string
+    # git just emitted; on any failure fall back to 0 (the day-count line still
+    # renders — the drift is real even if the commit tally is unavailable).
+    commits = 0
+    try:
+        rl = subprocess.run(
+            ["git", "-C", str(root), "rev-list", "--count", f"--since={last_updated}", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if rl.returncode == 0:
+            commits = int((rl.stdout or "0").strip() or "0")
+    except (FileNotFoundError, subprocess.SubprocessError, OSError, ValueError):
+        commits = 0
+
+    return days, commits
+
+
+def recent_snapshots(root: Path, n: int = 3) -> list[tuple[str, int, str]]:
+    """Return [(basename, count, latest_filename)] for the N most-recently-
+    updated snapshot basenames."""
+    snap_dir = root / ".claude" / "snapshots"
+    if not snap_dir.is_dir():
+        return []
+    entries: list[tuple[str, int, str, float]] = []
+    for d in snap_dir.iterdir():
+        if not d.is_dir():
+            continue
+        files = sorted(p for p in d.iterdir() if p.is_file())
+        if not files:
+            continue
+        latest = files[-1]
+        entries.append((d.name, len(files), latest.name, latest.stat().st_mtime))
+    entries.sort(key=lambda x: x[3], reverse=True)
+    return [(name, count, latest) for name, count, latest, _ in entries[:n]]
+
+
+def _flatten(v: object) -> str:
+    """Phase O #70 (round-3 reviewer F3): newline-prefix injection defense.
+
+    objective / current_focus are single-line metadata fields embedded into
+    the orient block, which session-start-orient.sh emits into model context.
+    A poisoned value carrying a `\\n\\nSYSTEM: ignore previous` blank-line
+    separator would read as a fresh injected instruction section. Collapse
+    any CR/LF run to a single space (also strips stray CR — handoff
+    learning #5). Text is defanged, not deleted, consistent with the <>
+    treatment in session-start-orient.sh (Phase M #64).
+    """
+    return re.sub(r"[\r\n]+", " ", str(v))
+
+
+# #68 (baseline F22): cross-reference state.json topics with the per-project
+# auto-memory index. CLAUDE_CONFIG_DIR is Claude Code's documented knob for
+# relocating the .claude home; honoring it makes path resolution
+# production-correct AND is the test seam (fixtures point it at a temp dir).
+MEMORY_CROSSREF_CAP = 3
+# Tiny stopword set: common >=5-char words that would over-match the haystack.
+# Conservative on purpose — the >=5-length floor already drops most noise.
+_MEMORY_STOPWORDS = frozenset({"about", "after", "again", "their", "there",
+                               "these", "those", "which", "would", "should",
+                               "could", "other", "notes", "thing", "stuff"})
+# Markdown index list-item: "- [Title](target) — trailing hook". Captures
+# Title and target; trailing prose (after the link) is ignored.
+_MEMORY_ENTRY_RE = re.compile(r"^\s*[-*]\s+\[([^\]]+)\]\(([^)]+)\)")
+
+
+def memory_crossrefs(root: Path, state: dict) -> list[str]:
+    """Return orient-block lines linking auto-memory entries whose Title shares
+    a topic token with state.json's objective/current_focus, else [].
+
+    #68: the auto-memory index lives at
+    `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<sanitized-root>/memory/MEMORY.md`
+    where `sanitized` replaces `:` `/` `\\` in the resolved root with `-`
+    (Claude Code's per-project memory-dir convention). Cheap silent-skip
+    (no line, no crash, ~one stat on the common no-memory repo) when the index
+    is absent / unreadable / parses to zero entries / yields zero matches.
+
+    Match heuristic (deterministic): topic tokens = lowercased alphanumeric
+    words of length >=5 from each Title (minus a tiny stopword set); an entry
+    matches iff any token is a substring of (objective + " " + current_focus)
+    lowercased. Matched entries are surfaced in MEMORY.md file order, capped at
+    MEMORY_CROSSREF_CAP. Every surfaced string is _flatten()'d (CR/LF -> space)
+    so a poisoned Title cannot inject a blank-line separator; the assembled
+    block additionally gets session-start-orient.sh's <> -> ‹› defang. Composed
+    defense-in-depth, mirroring how render() flattens objective/current_focus.
+    """
+    memory_base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    sanitized = re.sub(r"[:/\\]", "-", str(root.resolve()))
+    index = Path(memory_base) / "projects" / sanitized / "memory" / "MEMORY.md"
+
+    # is_file() FIRST so the common no-memory repo pays ~one stat and bails.
+    if not index.is_file():
+        return []
+    try:
+        text = index.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    haystack = (
+        str(state.get("objective", "")) + " " + str(state.get("current_focus", ""))
+    ).lower()
+    if not haystack.strip():
+        return []
+
+    matched: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        m = _MEMORY_ENTRY_RE.match(line)
+        if not m:
+            continue
+        title, target = m.group(1), m.group(2)
+        tokens = [
+            w for w in re.findall(r"[a-z0-9]+", title.lower())
+            if len(w) >= 5 and w not in _MEMORY_STOPWORDS
+        ]
+        if any(tok in haystack for tok in tokens):
+            matched.append((title, target))
+        if len(matched) >= MEMORY_CROSSREF_CAP:
+            break
+
+    if not matched:
+        return []
+
+    out = ["Related auto-memory:"]
+    for title, target in matched:
+        out.append(f"  • {_flatten(title)} ({_flatten(target)})")
+    return out
+
+
+def render(state: dict, root: Path) -> str:
+    lines: list[str] = []
+    lines.append("=== WHERE YOU ARE ===")
+    lines.append(f"Project: {root.name}")
+
+    version = state.get("version", "(unset)")
+    objective = _flatten(state.get("objective", "(no objective set)"))
+    focus = _flatten(state.get("current_focus", "(no current focus set)"))
+    lines.append(f"Version: {version} | Objective: {objective}")
+    lines.append(f"Focus:   {focus}")
+
+    current_norm = normalize_version(version)
+    # Type-guard: tolerate malformed state.json where collections are wrong type
+    raw_deliv = state.get("deliverables", [])
+    deliverables = [d for d in raw_deliv if isinstance(d, dict)] if isinstance(raw_deliv, list) else []
+    in_progress = [d for d in deliverables if d.get("status") == "in_progress"]
+    deferred = [d for d in deliverables if d.get("status") == "deferred"]
+    deferred_this = [d for d in deferred if normalize_version(d.get("version")) == current_norm]
+    deferred_later = [d for d in deferred if normalize_version(d.get("version")) != current_norm]
+    blocked_in_deliv = [d for d in deliverables if d.get("status") == "blocked"]
+
+    lines.append("")
+    lines.append(f"In-progress ({len(in_progress)}):")
+    if not in_progress:
+        lines.append("  (none)")
+    for d in in_progress:
+        started = d.get("started_at", "")
+        suffix = f" (started {started})" if started else ""
+        lines.append(f"  • {d.get('id','?')} — {d.get('title','?')}{suffix}")
+
+    lines.append("")
+    lines.append(f"Deferred for this version ({len(deferred_this)}):")
+    if not deferred_this:
+        lines.append("  (none)")
+    for d in deferred_this:
+        reason = d.get("deferred_reason", "(no reason)")
+        lines.append(f"  • {d.get('id','?')} — {d.get('title','?')}: {reason}")
+
+    lines.append("")
+    lines.append(f"Deferred for later versions ({len(deferred_later)}):")
+    if not deferred_later:
+        lines.append("  (none)")
+    for d in deferred_later:
+        target = d.get("version", "?")
+        reason = d.get("deferred_reason", "(no reason)")
+        lines.append(f"  • {d.get('id','?')} (→ {target}) — {reason}")
+
+    raw_blocked = state.get("blocked", [])
+    blocked_top = [b for b in raw_blocked if isinstance(b, dict)] if isinstance(raw_blocked, list) else []
+    blocked_total = blocked_top + blocked_in_deliv
+    lines.append("")
+    lines.append(f"Blocked ({len(blocked_total)}):")
+    if not blocked_total:
+        lines.append("  (none)")
+    for b in blocked_top:
+        lines.append(
+            f"  • {b.get('title', b.get('id','?'))} — "
+            f"{b.get('blocked_on','?')} (since {b.get('since','?')})"
+        )
+    for d in blocked_in_deliv:
+        lines.append(
+            f"  • {d.get('id','?')} — {d.get('title','?')}: "
+            f"{d.get('blocked_on','(no reason)')}"
+        )
+
+    raw_questions = state.get("open_questions", [])
+    questions = [q for q in raw_questions if isinstance(q, dict)] if isinstance(raw_questions, list) else []
+    open_q = [q for q in questions if not q.get("resolved_at")]
+    lines.append("")
+    lines.append(f"Open questions ({len(open_q)}):")
+    if not open_q:
+        lines.append("  (none)")
+    for q in open_q:
+        lines.append(f"  • {q.get('q','?')} (asked {q.get('asked_at','?')})")
+
+    last = state.get("last_updated", "")
+    lines.append("")
+    lines.append(f"Last update: {last} ({relative_age(last)})")
+
+    # #23 (audit F5 / F14): state-drift-from-HEAD signal. The phrasing/format
+    # mirrors the #24 statusline suffix's glyph + "stale Nd". Composed from
+    # integers only (no state-derived free text), so it adds no new injection
+    # surface; the <>/newline-flatten defenses (#64/#70) still wrap the block.
+    stale = compute_staleness(state, root)
+    if stale is not None:
+        days, commits_ahead = stale
+        lines.append(f"⚠ stale by {days}d, {commits_ahead} commits ahead")
+
+    # #68 (baseline F22): cross-ref auto-memory entries whose Title topic shows
+    # up in objective/current_focus. Cheap silent-skip (no line) when the
+    # per-project MEMORY.md index is absent or no entry matches; every surfaced
+    # string is _flatten()'d inside memory_crossrefs (and the whole block then
+    # gets the hook's <> defang), so it adds no newline/markup injection surface.
+    lines.extend(memory_crossrefs(root, state))
+
+    commits = git_log(root, 5)
+    if commits:
+        lines.append("Recent commits:")
+        for c in commits:
+            lines.append(f"  {c}")
+
+    snaps = recent_snapshots(root, 3)
+    if snaps:
+        lines.append("Recent snapshots:")
+        for name, count, latest in snaps:
+            lines.append(f"  {name} — {count} snapshot(s), latest: {latest}")
+
+    return "\n".join(lines)
+
+
+def render_history(root: Path, deliverable_id: str) -> str:
+    """#67: render the append-only transition log for one deliverable.
+
+    Reads `.claude/state-history.jsonl` via `_state_lib.read_history` (which
+    silently skips malformed/blank lines). Renders one compact line per
+    transition. Graceful, no-traceback for the two empty cases:
+      - the log file does not exist yet → "no deliverable history recorded yet"
+      - the log exists but holds zero records for this id → a per-id note.
+    Composed from history fields only; the assembled block still flows through
+    session-start-orient.sh's <>/newline defang when surfaced.
+    """
+    lines: list[str] = []
+    lines.append(f"=== Deliverable history: {deliverable_id} ===")
+    if not history_path(root).is_file():
+        lines.append("  (no deliverable history recorded yet)")
+        return "\n".join(lines)
+    records = read_history(root, deliverable_id)
+    if not records:
+        lines.append(f"  (no transitions recorded for {deliverable_id})")
+        return "\n".join(lines)
+    for rec in records:
+        ts = rec.get("ts", "?")
+        frm = rec.get("from", "?")
+        to = rec.get("to", "?")
+        session = rec.get("session_id", "?")
+        lines.append(f"  {ts}  {frm} → {to}  (session {session})")
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("--help", "-h"):
+        print(__doc__)
+        return 0
+
+    json_mode = "--json" in argv
+    args = [a for a in argv if a != "--json"]
+
+    # #67: --history <id> renders the append-only transition log for one
+    # deliverable, then exits. It is independent of state.json (history is a
+    # companion file), so it does not silent-skip when state.json is absent.
+    if "--history" in args:
+        hi = args.index("--history")
+        if hi + 1 >= len(args):
+            print("where-am-i: --history requires a deliverable id", file=sys.stderr)
+            return 2
+        deliverable_id = args[hi + 1]
+        # Remaining args (minus the flag + its value) may carry a root path.
+        rest = args[:hi] + args[hi + 2:]
+        target = rest[0] if rest else None
+        root = project_root(target)
+        print(render_history(root, deliverable_id))
+        return 0
+
+    target = args[0] if args else None
+
+    root = project_root(target)
+    state = load_state(root)
+
+    if state is None:
+        # Silent skip — no .claude/state.json present. Return 0 so SessionStart
+        # hook callers don't print error noise on uninstrumented projects.
+        return 0
+
+    if json_mode:
+        print(json.dumps(state, indent=2))
+        return 0
+
+    print(render(state, root))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

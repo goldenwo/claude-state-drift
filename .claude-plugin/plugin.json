@@ -1,0 +1,17 @@
+{
+  "name": "claude-state-drift",
+  "version": "0.1.0",
+  "description": "State-tracking + drift-mitigation for Claude Code. Maintains a .claude/state.json (objective / current_focus / deliverables) and surfaces it via a SessionStart orientation block, a UserPromptSubmit focus-check, and auto-staleness nudges — plus where-am-i / update-state / re-anchor commands and skills to keep long sessions anchored to their goal.",
+  "author": {
+    "name": "goldenwo"
+  },
+  "homepage": "https://github.com/goldenwo/claude-state-drift",
+  "repository": "https://github.com/goldenwo/claude-state-drift",
+  "license": "MIT",
+  "keywords": [
+    "state-tracking",
+    "drift-mitigation",
+    "orientation",
+    "session-state"
+  ]
+}

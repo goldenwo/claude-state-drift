@@ -1,0 +1,3 @@
+# This repo is a GENERATED mirror -- the regen-drift gate compares BYTES of a
+# fresh rebuild against this checkout. Any EOL conversion would false-fire it.
+* -text

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""statusline-focus — render the current state.json focus into a status line.
+
+Reads `<cwd>/.claude/state.json` and prints a compact line suitable for
+Claude Code's `statusLine` config:
+
+    v0.3.1 · focus: <truncated current_focus>
+
+When `last_updated` lags HEAD commit time by more than the staleness
+threshold (default 24h; override via `STATE_STALENESS_HOURS`), appends a
+warning suffix in integer days:
+
+    v0.3.1 · focus: ... · ⚠ stale 2d
+
+Set `STATE_STALENESS_DISABLE=1` to suppress the suffix.
+
+Claude Code invokes `statusLine` commands from the session's working
+directory, so `Path.cwd()` resolves to the right project. No stdin read
+(intentionally — `where-am-i` pattern, avoids hang risk on direct CLI
+invocation).
+
+If state.json is missing or malformed, prints nothing — uninstrumented
+projects pay nothing. If git is unavailable or `.git` is missing, the
+staleness suffix is silently skipped (focus still shown).
+
+Wire up in `~/.claude/settings.json`:
+    "statusLine": {
+        "type": "command",
+        "command": "python ${CLAUDE_PLUGIN_ROOT}/bin/statusline-focus"
+    }
+"""
+
+import os
+import sys
+import json
+import subprocess
+from pathlib import Path
+
+from _state_lib import compute_lag_days, resolve_staleness_hours  # noqa: E402
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+MAX_FOCUS_CHARS = 80
+
+
+def truncate(s: str, n: int) -> str:
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    last_space = cut.rfind(" ")
+    if last_space > n // 2:
+        cut = cut[:last_space]
+    return cut + "…"
+
+
+def compute_staleness_days(state: dict, cwd: Path) -> int | None:
+    """Return integer days of lag if state is stale beyond threshold, else None.
+
+    Silent-skip (returns None) on any of: STATE_STALENESS_DISABLE=1, missing
+    .git, missing/malformed last_updated, git invocation failure, state newer
+    than HEAD, lag at-or-below threshold. Delegates ISO parsing + lag math to
+    `_state_lib.compute_lag_days` so the calculation lives in one place.
+    """
+    if os.environ.get("STATE_STALENESS_DISABLE") == "1":
+        return None
+    if not (cwd / ".git").exists():
+        return None
+
+    threshold_h = resolve_staleness_hours()
+
+    last_updated = state.get("last_updated")
+    if not isinstance(last_updated, str) or not last_updated:
+        return None
+
+    try:
+        proc = subprocess.run(
+            ["git", "log", "-1", "--format=%aI", "HEAD"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    head_iso = (proc.stdout or "").strip()
+    if not head_iso:
+        return None
+
+    return compute_lag_days(last_updated, head_iso, threshold_hours=threshold_h)
+
+
+def main(argv: list[str]) -> int:
+    if any(a in ("--help", "-h") for a in argv):
+        print(__doc__)
+        return 0
+
+    cwd = Path.cwd()
+    state_file = cwd / ".claude" / "state.json"
+    if not state_file.is_file():
+        return 0
+
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return 0
+
+    version = state.get("version", "?")
+    if not isinstance(version, str):
+        version = str(version)
+
+    focus = state.get("current_focus", "") or ""
+    if not isinstance(focus, str):
+        focus = ""
+
+    stale_days = compute_staleness_days(state, cwd)
+    stale_suffix = f" · ⚠ stale {stale_days}d" if stale_days is not None else ""
+
+    if focus:
+        print(f"v{version} · focus: {truncate(focus, MAX_FOCUS_CHARS)}{stale_suffix}")
+    else:
+        print(f"v{version}{stale_suffix}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

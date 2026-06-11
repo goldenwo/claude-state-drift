@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""state-history — append-only audit log writer for deliverable transitions (#67).
+
+state.json carries `deliverables[]` but no record of *when* / *in which
+session* a deliverable moved between statuses. This writer appends one compact
+JSON line per transition to the COMPANION file `<root>/.claude/state-history.jsonl`:
+
+    {"deliverable_id": "...", "from": "...", "to": "...",
+     "ts": "<ISO8601 UTC ...Z>", "session_id": "..."}
+
+The log is APPEND-ONLY — an audit trail. It is deliberately NOT part of
+state.json and is NOT validated by `bin/state-validate`. The READ side is
+`where-am-i --history <id>`; both share `_state_lib` (append_history /
+read_history) so the on-disk format has a single owner.
+
+`bin/where-am-i` is intentionally read-only; the write path lives here so the
+orientation CLI never mutates project state.
+
+Usage:
+    state-history append --id <deliverable_id> --from <status> --to <status>
+                         [--ts <iso>] [--session <id>] [--root <path>] [<path>]
+
+Flags:
+    --id        deliverable id (required)
+    --from      previous status, or "none" for a brand-new deliverable (required)
+    --to        new status (required)
+    --ts        ISO 8601 timestamp; default = now (UTC, ...Z)
+    --session   session id; default = $CLAUDE_SESSION_ID, else "unknown"
+    --root      project root; default = $CLAUDE_PROJECT_DIR, else cwd
+                (a bare positional path is also accepted, matching where-am-i)
+
+Exit codes:
+    0  record appended
+    2  usage error (missing/unknown flag) — message on stderr, no traceback
+    1  unexpected I/O failure — message on stderr, no traceback
+"""
+
+import os
+import sys
+from pathlib import Path
+
+from _state_lib import append_history  # noqa: E402
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def project_root(arg):
+    """Resolve the project root — mirrors bin/where-am-i.project_root."""
+    if arg:
+        return Path(arg).resolve()
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env:
+        return Path(env).resolve()
+    return Path.cwd()
+
+
+def _take_value(argv, i, flag):
+    """Return (value, next_index) for a `--flag value` pair, or error out."""
+    if i + 1 >= len(argv):
+        print(f"state-history: {flag} requires a value", file=sys.stderr)
+        return None, None
+    return argv[i + 1], i + 2
+
+
+def _parse_append(argv):
+    """Parse the `append` subcommand argv. Returns a dict on success, or None
+    on a usage error (after printing a stderr message)."""
+    opts = {"id": None, "from": None, "to": None, "ts": None,
+            "session": None, "root": None}
+    positional = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--id", "--from", "--to", "--ts", "--session", "--root"):
+            val, nxt = _take_value(argv, i, a)
+            if val is None:
+                return None
+            opts[a[2:]] = val
+            i = nxt
+        elif a in ("--help", "-h"):
+            print(__doc__)
+            return {"_help": True}
+        elif a.startswith("--"):
+            print(f"state-history: unknown flag: {a}", file=sys.stderr)
+            return None
+        else:
+            positional = a
+            i += 1
+    opts["_positional"] = positional
+
+    missing = [f"--{k}" for k in ("id", "from", "to") if not opts[k]]
+    if missing:
+        print(
+            "state-history append: missing required "
+            + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return None
+    return opts
+
+
+def main(argv):
+    if argv and argv[0] in ("--help", "-h"):
+        print(__doc__)
+        return 0
+
+    if not argv or argv[0] != "append":
+        print(
+            "state-history: usage: state-history append --id <id> "
+            "--from <status> --to <status> [--ts <iso>] [--session <id>] "
+            "[--root <path>]",
+            file=sys.stderr,
+        )
+        return 2
+
+    opts = _parse_append(argv[1:])
+    if opts is None:
+        return 2
+    if opts.get("_help"):
+        return 0
+
+    root = project_root(opts.get("root") or opts.get("_positional"))
+
+    # session id: --session > $CLAUDE_SESSION_ID > "unknown". The fallback
+    # keeps the writer non-fatal when no session id is available (e.g. invoked
+    # outside a Claude Code session).
+    session_id = opts["session"]
+    if not session_id:
+        session_id = os.environ.get("CLAUDE_SESSION_ID") or "unknown"
+
+    try:
+        rec = append_history(
+            root,
+            opts["id"],
+            opts["from"],
+            opts["to"],
+            ts=opts["ts"],
+            session_id=session_id,
+        )
+    except OSError as e:
+        print(f"state-history: failed to append history: {e}", file=sys.stderr)
+        return 1
+
+    print(f"{rec['deliverable_id']}: {rec['from']} → {rec['to']} ({rec['ts']})")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

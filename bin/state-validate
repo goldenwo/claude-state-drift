@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""state-validate — schema validator for .claude/state.json (stdlib only).
+
+Validates structure, types, and invariants. Prints findings; exits non-zero
+on errors. Warnings don't fail the validation (exit 0 with warnings is OK).
+
+Usage:
+    state-validate [<path>]    (default: <cwd>/.claude/state.json)
+    state-validate --json      (machine-readable output)
+    state-validate --help
+
+Exit codes:
+    0  valid (no errors; warnings allowed)
+    1  invalid (one or more errors)
+    2  arg / IO error (file missing, JSON parse error)
+
+Wired into the `update-state` skill as a pre-write gate so bad writes are
+caught before they land. Add to CI for ongoing regression protection.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+from _state_lib import parse_iso  # noqa: E402
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+VALID_STATUSES = {"done", "in_progress", "deferred", "blocked"}
+REQUIRED_TOP = {"objective", "version", "current_focus", "last_updated"}
+REQUIRED_DELIVERABLE = {"id", "title", "status"}
+CURRENT_SCHEMA_VERSION = 1
+
+
+def validate(state):
+    """Return list of {severity, field, message} dicts."""
+    findings = []
+
+    if not isinstance(state, dict):
+        return [{"severity": "error", "field": "<root>", "message": "state.json must be a JSON object"}]
+
+    for f in REQUIRED_TOP:
+        if f not in state:
+            findings.append({"severity": "error", "field": f, "message": "missing required field"})
+        elif not isinstance(state[f], str):
+            findings.append({"severity": "error", "field": f, "message": f"must be a string, got {type(state[f]).__name__}"})
+
+    if isinstance(state.get("last_updated"), str) and parse_iso(state["last_updated"]) is None:
+        findings.append({"severity": "error", "field": "last_updated", "message": "not a valid ISO 8601 timestamp"})
+
+    if state.get("objective_set_at") is not None:
+        if not isinstance(state["objective_set_at"], str) or parse_iso(state["objective_set_at"]) is None:
+            findings.append({"severity": "warning", "field": "objective_set_at", "message": "should be ISO 8601 date"})
+
+    if "schema_version" not in state:
+        findings.append({"severity": "warning", "field": "schema_version",
+                         "message": f"missing — add `schema_version: {CURRENT_SCHEMA_VERSION}` for future migration safety"})
+    elif state["schema_version"] != CURRENT_SCHEMA_VERSION:
+        findings.append({"severity": "warning", "field": "schema_version",
+                         "message": f"value {state['schema_version']!r} differs from expected {CURRENT_SCHEMA_VERSION}"})
+
+    delivs = state.get("deliverables")
+    if delivs is not None:
+        if not isinstance(delivs, list):
+            findings.append({"severity": "error", "field": "deliverables", "message": "must be a list"})
+        else:
+            seen_ids = set()
+            for i, d in enumerate(delivs):
+                prefix = f"deliverables[{i}]"
+                if not isinstance(d, dict):
+                    findings.append({"severity": "error", "field": prefix, "message": "must be an object"})
+                    continue
+                for rf in REQUIRED_DELIVERABLE:
+                    if rf not in d:
+                        findings.append({"severity": "error", "field": f"{prefix}.{rf}", "message": "missing required field"})
+                did = d.get("id")
+                if isinstance(did, str):
+                    if did in seen_ids:
+                        findings.append({"severity": "error", "field": f"{prefix}.id", "message": f"duplicate id {did!r}"})
+                    seen_ids.add(did)
+                ds = d.get("status")
+                if ds is not None and ds not in VALID_STATUSES:
+                    findings.append({"severity": "error", "field": f"{prefix}.status",
+                                     "message": f"invalid status {ds!r} (must be one of {sorted(VALID_STATUSES)})"})
+                if ds == "in_progress" and "started_at" not in d:
+                    findings.append({"severity": "warning", "field": f"{prefix}.started_at",
+                                     "message": "in-progress deliverable should have started_at"})
+                if ds == "done" and "completed_at" not in d:
+                    findings.append({"severity": "warning", "field": f"{prefix}.completed_at",
+                                     "message": "done deliverable should have completed_at"})
+                if ds == "deferred" and "deferred_reason" not in d:
+                    findings.append({"severity": "warning", "field": f"{prefix}.deferred_reason",
+                                     "message": "deferred deliverable should have deferred_reason"})
+                if ds == "blocked" and "blocked_on" not in d:
+                    findings.append({"severity": "warning", "field": f"{prefix}.blocked_on",
+                                     "message": "blocked deliverable should have blocked_on"})
+                if "version" in d and not isinstance(d["version"], str):
+                    findings.append({"severity": "warning", "field": f"{prefix}.version",
+                                     "message": f"should be a string, got {type(d['version']).__name__}"})
+                for date_field in ("started_at", "completed_at", "status_changed_at"):
+                    val = d.get(date_field)
+                    if val is not None:
+                        if not isinstance(val, str) or parse_iso(val) is None:
+                            findings.append({"severity": "warning", "field": f"{prefix}.{date_field}",
+                                             "message": "not a valid ISO 8601 date"})
+
+    blocked = state.get("blocked")
+    if blocked is not None:
+        if not isinstance(blocked, list):
+            findings.append({"severity": "error", "field": "blocked", "message": "must be a list"})
+        else:
+            for i, b in enumerate(blocked):
+                bprefix = f"blocked[{i}]"
+                if not isinstance(b, dict):
+                    findings.append({"severity": "error", "field": bprefix, "message": "must be an object"})
+                    continue
+                for rf in ("id", "blocked_on"):
+                    if rf not in b:
+                        findings.append({"severity": "warning", "field": f"{bprefix}.{rf}",
+                                         "message": "blocked entries should have id + blocked_on"})
+                if "since" in b and isinstance(b["since"], str) and parse_iso(b["since"]) is None:
+                    findings.append({"severity": "warning", "field": f"{bprefix}.since",
+                                     "message": "not a valid ISO 8601 date"})
+
+    oq = state.get("open_questions")
+    if oq is not None:
+        if not isinstance(oq, list):
+            findings.append({"severity": "error", "field": "open_questions", "message": "must be a list"})
+        else:
+            for i, q in enumerate(oq):
+                qprefix = f"open_questions[{i}]"
+                if not isinstance(q, dict):
+                    findings.append({"severity": "error", "field": qprefix, "message": "must be an object"})
+                    continue
+                if "q" not in q:
+                    findings.append({"severity": "error", "field": f"{qprefix}.q", "message": "missing required field"})
+                for date_field in ("asked_at", "resolved_at"):
+                    val = q.get(date_field)
+                    if val is not None and (not isinstance(val, str) or parse_iso(val) is None):
+                        findings.append({"severity": "warning", "field": f"{qprefix}.{date_field}",
+                                         "message": "not a valid ISO 8601 date"})
+
+    return findings
+
+
+def render(state_path, findings, json_mode):
+    errors = [f for f in findings if f["severity"] == "error"]
+    warnings = [f for f in findings if f["severity"] == "warning"]
+
+    if json_mode:
+        print(json.dumps({
+            "path": str(state_path),
+            "valid": len(errors) == 0,
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+            "findings": findings,
+        }, indent=2))
+    else:
+        if not findings:
+            print(f"state-validate: {state_path} is valid.")
+        else:
+            print(f"state-validate: {state_path}")
+            for f in findings:
+                marker = "ERROR" if f["severity"] == "error" else "WARN "
+                print(f"  [{marker}] {f['field']}: {f['message']}")
+            print(f"\nSummary: {len(errors)} error(s), {len(warnings)} warning(s)")
+    return 1 if errors else 0
+
+
+def main(argv):
+    if any(a in ("--help", "-h") for a in argv):
+        print(__doc__)
+        return 0
+
+    json_mode = "--json" in argv
+    args = [a for a in argv if a != "--json"]
+
+    state_path = Path(args[0]) if args else Path.cwd() / ".claude" / "state.json"
+
+    if not state_path.is_file():
+        msg = f"state-validate: file not found: {state_path}"
+        if json_mode:
+            print(json.dumps({"error": msg, "valid": False, "findings": []}))
+        else:
+            print(msg, file=sys.stderr)
+        return 2
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        msg = f"state-validate: invalid JSON in {state_path}: {e}"
+        if json_mode:
+            print(json.dumps({"error": msg, "valid": False, "findings": []}))
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    return render(state_path, validate(state), json_mode)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

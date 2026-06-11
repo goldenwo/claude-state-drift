@@ -1,0 +1,18 @@
+{
+  "name": "claude-state-drift",
+  "owner": {
+    "name": "goldenwo"
+  },
+  "description": "Marketplace for the claude-state-drift plugin — state-tracking + drift-mitigation for Claude Code.",
+  "plugins": [
+    {
+      "name": "claude-state-drift",
+      "source": "./",
+      "description": "State-tracking + drift-mitigation for Claude Code. Maintains a .claude/state.json (objective / current_focus / deliverables) and surfaces it via a SessionStart orientation block, a UserPromptSubmit focus-check, and auto-staleness nudges — plus where-am-i / update-state / re-anchor commands and skills to keep long sessions anchored to their goal.",
+      "version": "0.1.0",
+      "author": {
+        "name": "goldenwo"
+      }
+    }
+  ]
+}

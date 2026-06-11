@@ -1,0 +1,11 @@
+{
+  "_doc": "Per-hook p95 latency budgets in milliseconds (documentation data).",
+  "_methodology": "Each hook is fired repeatedly against a representative fixture; the p95 duration is compared against budget * multiplier.",
+  "_multiplier": "Local default 1.0; CI raises PERF_BUDGET_MULTIPLIER to absorb runner variance.",
+  "budgets_ms": {
+    "focus-check.sh": 600,
+    "state-track-commit.sh": 1200,
+    "state-staleness.sh": 1500,
+    "session-start-orient.sh": 2000
+  }
+}

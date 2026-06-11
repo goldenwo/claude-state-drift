@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""read-trusted-config — race-free first-non-comment-line reader for the
+`.claude/lint-command` / `.claude/test-command` trust-boundary configs.
+
+ROADMAP #75 / Sec P2-E (debt burn-down Wave B). Closes a TOCTOU window in
+`hooks/lint-after-write.sh` `get_lint_command` and `hooks/stop-runs-tests.sh`
+`get_test_command`. Post #83/#84 those functions did, by path, in sequence:
+
+    [[ -f $cfg ]]                  # path stat
+    realpath $cfg  (escape check)  # path resolution #1
+    [[ -L $cfg ]]  (symlink guard) # path resolution #2  (lstat by path)
+    grep ... "$cfg" | head -1      # path resolution #3  (open by path)
+
+The `[[ -L ]]` direct-symlink guard (#83/#84, Phase Q C-new-2 / F-A) and the
+content read are TWO independent resolutions of the same path string. A
+co-located non-root attacker with concurrent-write ability on the same fs
+can swap `$cfg` between guard and read (rename the regular file aside,
+drop a symlink → attacker payload in its place); the guard "passed" on the
+regular file a moment earlier, but `grep` re-opens by path and follows the
+freshly-planted symlink — defeating the symlink defense. Rare (needs
+concurrent-write + same-fs non-root attacker) but real.
+
+Fix (mirrors bin/state-lock's Phase O #74 O_NOFOLLOW precedent): open the
+file EXACTLY ONCE with `os.open(cfg, O_RDONLY | O_NOFOLLOW)` and read its
+content via that single fd. O_NOFOLLOW makes a symlink-at-$cfg fail
+atomically with ELOOP — the SAME syscall that yields the fd we read, so
+there is no second path resolution to race. The `[[ -L $cfg ]]` layer is
+thus SUBSUMED (strictly stronger: race-free). The realpath-escape layer
+(a symlinked PARENT dir, regular file inside) is a DIFFERENT vector that
+O_NOFOLLOW-on-$cfg does not cover — it stays in the bash callers, ahead of
+this read. Both #83/#84 defended vectors are preserved.
+
+Usage (from the bash hooks, mirroring hooks/state-staleness.sh →
+bin/_state_lib.py):
+
+    cmd=$("$PYTHON_BIN" "$(dirname "$0")/../bin/read-trusted-config" "$cfg")
+    rc=$?
+    # rc 0  → $cmd is the first non-comment/non-blank line (may be empty
+    #         only if the file had no such line → caller treats as skip)
+    # rc 1  → no usable line (empty / all comments / blank) — caller skips
+    # rc 2  → REFUSED: symlink at $cfg (ELOOP), or open/IO error — caller
+    #         skips AND a one-line reason is printed to stderr (the bash
+    #         caller forwards it, mirroring the old `[[ -L ]]` echo)
+
+Windows: `O_NOFOLLOW` is POSIX-only (not in `os` on win32). Windows
+git-bash `ln -s` copies rather than making a real symlink (ROADMAP #79),
+so the direct-symlink vector does not exist there; we fall back to a plain
+`open()` — byte-for-byte the same bytes the old `grep`-by-path read would
+have produced. Windows behavior is unchanged, exactly as #74 kept Windows
+unchanged.
+
+Exit codes:
+    0  printed the first non-comment, non-blank line
+    1  no usable line (file empty / all-comment / all-blank)
+    2  refused (symlink at path / open error / usage error); reason on
+       stderr
+"""
+
+import os
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# 1 MiB ceiling — a lint/test-command config is one short line; this only
+# bounds a pathological/hostile file, it is never reached in practice.
+_MAX_BYTES = 1 << 20
+
+
+def _open_nofollow(path):
+    """Open `path` read-only, refusing a symlink AT `path` atomically.
+
+    POSIX: O_RDONLY | O_NOFOLLOW — a symlink at `path` fails with ELOOP
+    from the SAME syscall that returns the fd, so the guard decision and
+    the content read share one resolution (no TOCTOU). Mirrors
+    bin/state-lock `_open_lock_handle` (Phase O #74).
+
+    Windows: no O_NOFOLLOW (POSIX-only; absent from `os` on win32). Per
+    ROADMAP #79 Windows git-bash `ln -s` copies, so there is no real
+    symlink vector; a plain open yields the identical bytes the previous
+    `grep`-by-path read produced. Windows behavior unchanged.
+    """
+    flags = os.O_RDONLY
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if sys.platform != "win32" and nofollow:
+        flags |= nofollow
+    # os.O_BINARY only exists on Windows; harmless to OR in when present
+    # (keeps the read byte-accurate, no CRLF translation on the fd).
+    flags |= getattr(os, "O_BINARY", 0)
+    return os.open(path, flags)
+
+
+def _first_command_line(raw):
+    """First line that is not blank and not a `#`-comment (after leading
+    whitespace), decoded UTF-8 (lossy). Mirrors the bash predicate the
+    callers used: `grep -vE '^[[:space:]]*(#|$)' | head -1`.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    # NOTE: str.splitlines() also splits on a lone \r; GNU `grep`/`head`
+    # split on \n only. They therefore diverge ONLY for a lone-CR config
+    # (classic Mac OS 9 line endings) — which is benign and unreachable
+    # here: this file is project-owner-trusted and no real editor/tool
+    # emits lone-CR text. This comment is deliberate: do NOT "simplify"
+    # this filter on the assumption it is byte-equivalent to
+    # `grep -vE '^[[:space:]]*(#|$)' | head -1` for ALL inputs — it is
+    # equivalent for every realistic input (LF and CRLF) but the
+    # selection rule, not raw-newline parity, is the contract.
+    for line in text.splitlines():
+        stripped = line.lstrip(" \t")
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        return line
+    return None
+
+
+def main(argv):
+    if argv[:1] in (["--help"], ["-h"]):
+        sys.stdout.write(__doc__)
+        return 0
+    if len(argv) != 1:
+        sys.stderr.write("read-trusted-config: exactly one arg "
+                         "(the config path) required\n")
+        return 2
+
+    path = argv[0]
+    try:
+        fd = _open_nofollow(path)
+    except OSError as e:
+        # ELOOP (symlink at path, O_NOFOLLOW) lands here on POSIX, as do
+        # ENOENT / EACCES / EISDIR. The symlink case is the security-
+        # relevant one; all are "do not trust → skip" for the caller.
+        sys.stderr.write(
+            f"read-trusted-config: refusing to read {path} "
+            f"(open failed, possible symlink swap): {e}\n")
+        return 2
+    try:
+        try:
+            raw = os.read(fd, _MAX_BYTES)
+        except OSError as e:
+            sys.stderr.write(
+                f"read-trusted-config: refusing to read {path} "
+                f"(read failed): {e}\n")
+            return 2
+    finally:
+        os.close(fd)
+
+    line = _first_command_line(raw)
+    if line is None:
+        return 1
+    sys.stdout.write(line + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

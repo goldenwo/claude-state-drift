@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""read-hooks-config — race-free single-key reader for the per-project
+`.claude/hooks-config.json` unified hook-knob override file.
+
+ROADMAP #28 (audit F6; round-2 rescope to ONE unified file). One
+per-project JSON overrides every hook knob in one place instead of a
+file per knob:
+
+    {
+      "focus_check_every": 6,          # int  ≥1 — focus-check.sh cadence
+      "focus_check_disable": false,    # bool   — disable focus-check.sh
+      "lint_timeout_seconds": 15,      # int  ≥1 — lint-after-write.sh (#37)
+      "stop_test_timeout_seconds": 60, # int  ≥1 — stop-runs-tests.sh (#37)
+      "state_track_pattern": "ship|release|cut" # str — state-track-commit.sh
+    }                                  #            transition-keyword regex (#29)
+
+Unknown keys are ignored. Precedence is decided by the CALLER, not here:
+the hook checks its env var first (if set, that wins, byte-unchanged),
+then this reader's value, then its own built-in default. This script
+only answers "what does the file say for KEY" — never applies defaults.
+
+Security — mirrors bin/read-trusted-config (ROADMAP #75 / #74):
+`.claude/hooks-config.json` is a per-project file that may be malformed
+or hostile. It is opened EXACTLY ONCE with
+`os.open(path, O_RDONLY | O_NOFOLLOW)` and read via that single fd.
+O_NOFOLLOW makes a symlink-at-path fail atomically with ELOOP — the
+SAME syscall that yields the fd we read — so there is no second path
+resolution to race (the Sec P2-E TOCTOU class). No `eval`, no shell, no
+sourcing: the bytes are parsed by `json.loads`, never executed. A
+1 MiB ceiling bounds a pathological/hostile file.
+
+Windows: `O_NOFOLLOW` is POSIX-only (absent from `os` on win32) and
+git-bash `ln -s` copies rather than making a real symlink (ROADMAP
+#79), so the direct-symlink vector does not exist there; we fall back
+to a plain `open()` yielding identical bytes. Windows behavior matches
+read-trusted-config exactly (#74/#75 kept Windows unchanged).
+
+Silent-default contract (the strongest acceptance criterion for #28):
+a missing file, a malformed file, a key that is absent, or a value of
+the wrong type ALL yield exit 1 with EMPTY stdout and NO stderr — the
+caller then transparently uses its built-in default, so a repo without
+the file (the overwhelmingly common case) sees ZERO behavior change and
+ZERO stderr noise. The security-refusal path (symlink at path / IO
+error, exit 2) ALSO stays silent here: an uninstrumented/hostile config
+must never make a hot-path hook chatter; the caller treats 1 and 2
+identically (use the default). bin/read-trusted-config prints a refusal
+reason because its callers forward it as enforcement signal; a hook
+knob has no such surface, so this reader stays quiet by design.
+
+Usage (from a bash hook, mirroring the bin/read-trusted-config idiom):
+
+    val=$("$PYTHON_BIN" "$(dirname "$0")/../bin/read-hooks-config" \
+            "$cfg" focus_check_every)
+    rc=$?
+    # rc 0 → $val is the validated value for the key (use it)
+    # rc != 0 → no usable value (missing/malformed/absent/bad-type/
+    #           refused) → caller uses its own built-in default
+
+Exit codes:
+    0  printed the validated value for KEY (one line, no trailing junk)
+    1  no usable value (file missing / malformed JSON / not an object /
+       key absent / value wrong type / out-of-range int)
+    2  refused (symlink at path / open / read error) — also treated as
+       "use default" by callers; silent (no stderr) by design
+"""
+
+import json
+import os
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# 1 MiB ceiling — a hooks-config is a handful of short scalar keys; this
+# only bounds a pathological/hostile file, never reached in practice.
+_MAX_BYTES = 1 << 20
+
+# Schema: key → validator. Each validator returns the canonical string
+# to print on success, or None to reject (→ exit 1, caller defaults).
+# Unknown keys never reach a validator (argv key is looked up here).
+
+
+def _pos_int(v):
+    """Accept a JSON integer ≥ 1. Reject bool (bool is an int subclass
+    in Python — `True`/`False` must NOT pass an int knob), floats,
+    strings, and < 1. Returns the canonical decimal string or None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int) and v >= 1:
+        return str(v)
+    return None
+
+
+def _strict_bool(v):
+    """Accept ONLY a JSON boolean. Returns "1" for true, "0" for false
+    (a shell-friendly form the caller compares with `= "1"`), else
+    None. No truthy-coercion: a string/int is a schema violation →
+    default, not a silent surprising-true."""
+    if v is True:
+        return "1"
+    if v is False:
+        return "0"
+    return None
+
+
+def _nonempty_str(v):
+    """Accept ONLY a non-empty JSON string with no control characters.
+
+    Used by `state_track_pattern` (#29): a per-project regex fed to
+    `grep -E` in state-track-commit.sh. Three rejections, all → default:
+
+    * non-string (int/bool/list/object) — a schema violation, not coerced;
+    * empty / all-whitespace — an empty ERE matches EVERY commit subject
+      (false-fire on every commit), strictly worse than the default, so it
+      is rejected here rather than silently turned into a match-all;
+    * any control character (`\\n`, `\\r`, `\\t`, NUL, …) — the reader
+      contract is one value on one line (the caller reads a single line),
+      and a newline in a regex value is both a read-corruption and a
+      hostile-input vector. Printable junk that happens to be an invalid
+      ERE is NOT rejected here — the consuming hook validates the regex
+      against `grep -E` and falls back to its default on a syntax error,
+      so a malformed-but-printable pattern is a caller concern, not a
+      schema one (mirrors the int validators leaving range to the caller).
+
+    Returns the string verbatim (no normalization — a regex must reach
+    the hook byte-for-byte) or None to reject."""
+    if not isinstance(v, str):
+        return None
+    if not v.strip():
+        return None
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+        return None
+    return v
+
+
+_SCHEMA = {
+    "focus_check_every": _pos_int,
+    "focus_check_disable": _strict_bool,
+    "lint_timeout_seconds": _pos_int,
+    "stop_test_timeout_seconds": _pos_int,
+    # #29 — per-project deliverable-transition keyword regex for
+    # state-track-commit.sh (env STATE_TRACK_PATTERN > this > built-in
+    # default). A non-empty, control-char-free string; regex *validity*
+    # is enforced by the consuming hook (grep -E fallback-to-default),
+    # not here — see _nonempty_str.
+    "state_track_pattern": _nonempty_str,
+}
+
+
+def _open_nofollow(path):
+    """Open `path` read-only, refusing a symlink AT `path` atomically.
+
+    POSIX: O_RDONLY | O_NOFOLLOW — a symlink at `path` fails with ELOOP
+    from the SAME syscall that returns the fd, so the guard decision and
+    the content read share one resolution (no TOCTOU). Mirrors
+    bin/read-trusted-config (#75) / bin/state-lock (#74).
+
+    Windows: no O_NOFOLLOW (POSIX-only). Per ROADMAP #79 git-bash
+    `ln -s` copies, so there is no real symlink vector; a plain open
+    yields identical bytes. Windows behavior unchanged.
+    """
+    flags = os.O_RDONLY
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if sys.platform != "win32" and nofollow:
+        flags |= nofollow
+    # os.O_BINARY only exists on Windows; OR-in when present so the read
+    # is byte-accurate (no CRLF translation on the fd).
+    flags |= getattr(os, "O_BINARY", 0)
+    return os.open(path, flags)
+
+
+def main(argv):
+    if argv[:1] in (["--help"], ["-h"]):
+        sys.stdout.write(__doc__)
+        return 0
+    if len(argv) != 2:
+        # Usage error is a caller bug, not a hostile-input case; one
+        # line to stderr (parallels read-trusted-config's usage guard).
+        sys.stderr.write(
+            "read-hooks-config: exactly two args required "
+            "(config path, key)\n")
+        return 2
+
+    path, key = argv[0], argv[1]
+
+    validator = _SCHEMA.get(key)
+    if validator is None:
+        # Unknown key: not in schema → no usable value. Silent (this is
+        # a caller passing a key the schema doesn't define; the caller
+        # will use its default). No stderr — keep the hot path quiet.
+        return 1
+
+    try:
+        fd = _open_nofollow(path)
+    except OSError:
+        # ENOENT (no file — the common uninstrumented case), ELOOP
+        # (symlink at path, O_NOFOLLOW), EACCES, EISDIR all land here.
+        # ALL are "use the default" for the caller. Silent by design:
+        # a missing/hostile hook-knob file must never make a hot-path
+        # hook emit stderr (the #28 zero-noise acceptance criterion).
+        return 2
+    try:
+        try:
+            raw = os.read(fd, _MAX_BYTES)
+        except OSError:
+            return 2
+    finally:
+        os.close(fd)
+
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        # Malformed JSON → silent default (strongest #28 criterion:
+        # malformed file == no behavior change, no crash, no noise).
+        return 1
+
+    if not isinstance(data, dict):
+        # Top-level must be a JSON object; an array/scalar is a schema
+        # violation → default.
+        return 1
+    if key not in data:
+        # Key simply not set in this project's file → caller default.
+        return 1
+
+    out = validator(data[key])
+    if out is None:
+        # Present but wrong type / out of range → default (do NOT
+        # coerce; a surprising silent-true/zero is worse than default).
+        return 1
+
+    sys.stdout.write(out + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
