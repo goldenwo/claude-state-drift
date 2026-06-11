@@ -59,4 +59,3 @@ difference, so **hand-edits to this repo are rejected by design**: pull
 requests that touch files will fail the regeneration-drift gate. Bug reports
 and feature requests are welcome as issues; fixes land in the toolkit source
 and arrive here via a regenerated release.
-
