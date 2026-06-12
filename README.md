@@ -82,6 +82,31 @@ lives in a scrolling context window:
 | After a milestone commit | Nudge to record the transition in `state.json` | Project state lives only in git archaeology |
 | Next week's session | Picks up exactly where the file says you left off | Reconstruction from memory and scrollback |
 
+## With `/loop` and `/goal`
+
+Claude Code's loop primitives are session-scoped: `/goal` keeps a session iterating
+until a condition is met, `/loop` re-runs a prompt on a schedule — and both expire
+with the session. Neither writes anything to disk. `claude-state-drift` is the
+durable layer underneath:
+
+| Layer | Answers | Lives |
+|---|---|---|
+| `/loop` | when to run | the session |
+| `/goal` | when this run is done | the session |
+| `claude-state-drift` | what the project is trying to do, and where it left off | `.claude/state.json`, on disk |
+
+Patterns that compose well:
+
+- **Anchor a goal to state** — `/goal the invoice-preview-endpoint deliverable is
+  marked done in .claude/state.json`. The goal evaluator now checks something
+  durable and machine-validatable instead of transcript vibes, and completing the
+  goal leaves a record the next session reads.
+- **Loops inherit real state** — every fresh loop-driven session opens with the
+  WHERE YOU ARE block and records transitions via `/update-state` on the way out,
+  so iteration N+1 starts from the file, not from scrollback that no longer exists.
+- **Drift guard for unattended runs** — focus-check re-injects the objective every
+  few prompts, which matters most exactly when nobody is watching the loop work.
+
 ## Built with itself
 
 This plugin's own release pipeline was built while running the plugin — every
