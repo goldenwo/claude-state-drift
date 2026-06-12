@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.5-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.6-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -32,8 +32,9 @@ continuously re-surfaces it so the goal never depends on what's still in context
   every few prompts, so the goal never fully leaves context.
 - **Staleness nudges** — get flagged when `state.json` looks out of date relative to
   recent work, or when a commit looks like it finished a deliverable.
-- **Three commands** — `/where-am-i`, `/update-state` (drafts a reviewed state edit;
-  never auto-writes), `/re-anchor` (audits the session against the objective).
+- **Zero workflow change** — all of the above is automatic, driven by hooks. You
+  never have to remember to invoke anything; the [commands](#commands) exist for
+  when you *want* manual control.
 
 ## Install
 
@@ -48,7 +49,7 @@ Then drop a starter `.claude/state.json` into your project — copy one from
 
 ## How it works
 
-Four hooks and three commands, all reading one file:
+Four hooks — all automatic — and three optional commands, all reading one file:
 
 ```mermaid
 flowchart LR
@@ -69,6 +70,21 @@ flowchart LR
 - A `Stop` hook flags stale state; a `PostToolUse` hook notices commits whose subject
   suggests a deliverable transition and points you at `/update-state`.
 - Everything is computed from local files and local git.
+
+None of this needs you to do anything: install, drop in a `state.json`, and the
+hooks run on every session from then on. Claude also invokes the update and
+re-anchor skills on its own when it detects a finished deliverable or drift.
+
+## Commands
+
+For when you want to check or change state deliberately rather than waiting for
+a hook:
+
+| Command | What it does |
+|---|---|
+| `/where-am-i` | Print the orientation block on demand — objective, focus, deliverable statuses, recent commits. |
+| `/update-state` | Draft an update to `state.json` from recent work and show the diff. Never auto-writes — you approve every change. |
+| `/re-anchor` | Audit the current session against the objective and report alignment: on-track, mild drift, or significant drift. |
 
 ## With and without
 
