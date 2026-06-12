@@ -147,7 +147,7 @@ def normalize_version(v):
     return v
 
 
-# --- #67 deliverable-history append-only log -------------------------------
+# --- deliverable-history append-only log -----------------------------------
 #
 # state.json carries deliverables[] but no audit trail for "which session
 # transitioned deliverable X from in_progress -> done, and when?". The

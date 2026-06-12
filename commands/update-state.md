@@ -3,6 +3,6 @@ description: Draft an update to `.claude/state.json` based on recent work and sh
 allowed-tools: Read, Bash(git status), Bash(git diff:*), Bash(git log:*), Bash(where-am-i:*), Bash(python:*), Bash(state-validate:*), Edit, Write
 ---
 
-Invoke the Skill tool with `claude-harness-toolkit:update-state` against the current project. Do not inline or paraphrase the procedure — defer to the skill for the full contract (inspect current state + detect candidate transitions + draft a precise edit + show diff + wait for approval + validate after write).
+Invoke the Skill tool with `claude-state-drift:update-state` against the current project. Do not inline or paraphrase the procedure — defer to the skill for the full contract (inspect current state + detect candidate transitions + draft a precise edit + show diff + wait for approval + validate after write).
 
 If `.claude/state.json` doesn't exist in the current project, report that and skip (no enforcement on uninstrumented projects).

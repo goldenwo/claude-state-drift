@@ -5,9 +5,9 @@ Walks a configured root (default ~/dev/) for `.claude/state.json` files,
 renders each one's summary as a row in a single board:
 
     REPO                  VERSION       FOCUS                          OPEN  BLOCK  AGE
-    claude-harness-toolkit 0.3.0-dev    Building state-tracking infra  2     0      4m
-    edge-catcher          0.7.2         hypothesis-driven loop ref...  3     1      2h
-    universal-memory      0.6           pre-promotion validation       0     0      1d
+    my-api                1.4.0-dev     Wiring invoice-preview endp... 2     0      4m
+    my-cli                0.7.2         hypothesis-driven loop ref...  3     1      2h
+    my-lib                0.6           pre-promotion validation       0     0      1d
 
 Use `where-am-i <repo>` for full detail on any one project.
 

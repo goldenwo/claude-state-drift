@@ -7,7 +7,9 @@ plugin read and surface that file to keep long Claude Code sessions anchored to
 their goal.
 
 This document is the canonical schema. Validate any `state.json` with the bundled
-`state-validate` tool — it exits `0` when the file is valid.
+`state-validate` tool — it exits `0` when the file is valid. The tool is on the
+Bash tool's `PATH` in any Claude Code session while the plugin is enabled, so
+"run state-validate" just works.
 
 ## Top-level fields
 
@@ -74,11 +76,12 @@ edit the strings, and you have a valid starting point:
 Optional. A per-project JSON file that overrides the knobs of the shipped hooks.
 Unknown keys are ignored; a missing file means every hook uses its built-in default.
 
-| Key | Type | Default | Controls |
-|-----|------|---------|----------|
-| `focus_check_every` | integer ≥ 1 | `6` | How often (in user prompts) `focus-check` re-injects the objective. |
-| `focus_check_disable` | boolean | `false` | Disable the `focus-check` hook entirely. |
-| `state_track_pattern` | string (regex) | *(see below)* | Commit-subject keyword regex (extended POSIX ERE) that makes `state-track-commit` suggest a state update. The built-in default matches subjects containing `ship`/`shipped`/`release`/`released`/`complete`/`completed`/`done`/`finish`/`finished`/`deliver`/`delivered`, or a version tag like `v1.2`. |
+| Key | Type | Default | Env override | Controls |
+|-----|------|---------|--------------|----------|
+| `focus_check_every` | integer ≥ 1 | `6` | `FOCUS_CHECK_EVERY` | How often (in user prompts) `focus-check` re-injects the objective. |
+| `focus_check_disable` | boolean | `false` | `FOCUS_CHECK_DISABLE=1` | Disable the `focus-check` hook entirely. |
+| `state_track_pattern` | string (regex) | *(see below)* | `STATE_TRACK_PATTERN` | Commit-subject keyword regex (extended POSIX ERE) that makes `state-track-commit` suggest a state update. The built-in default matches subjects containing `ship`/`shipped`/`release`/`released`/`complete`/`completed`/`done`/`finish`/`finished`/`deliver`/`delivered`, or a version tag like `v1.2`. |
 
 Precedence per knob: the hook's environment variable (if set) wins, then this file,
-then the hook's built-in default.
+then the hook's built-in default. (`STATE_TRACK_DISABLE=1` also exists, env-only,
+to turn off `state-track-commit` entirely.)

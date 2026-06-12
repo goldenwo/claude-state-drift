@@ -40,14 +40,14 @@ Skip for trivial updates (typo fixes, single-line refactors). Trust the SessionS
 
 5. **Show the user.** Print a one-paragraph plain-English summary of the proposed changes (what's transitioning to what, what's new, what's resolved). Then show the actual `Edit` block ready to apply. **Wait for approval.**
 
-6. **On approval, apply.** Run the `Edit` tool. Then **run `python bin/state-validate` to verify the write produced a schema-valid state.json**. If validate reports errors, fix them before continuing (the diff likely missed a required field or has a malformed timestamp). Confirm with `python bin/where-am-i` to show the new orientation block.
+6. **On approval, apply.** Run the `Edit` tool. Then **run `state-validate` (on PATH while the plugin is enabled) to verify the write produced a schema-valid state.json**. If validate reports errors, fix them before continuing (the diff likely missed a required field or has a malformed timestamp). Confirm with `where-am-i` to show the new orientation block.
 
 7. **Status-transition tracking.** When changing a deliverable's `status` field, also set `status_changed_at` to the current ISO timestamp. This is the audit trail for "when did X transition" queries.
 
-8. **Append to the deliverable-history log (#67).** After the state.json `Edit` + `state-validate` pass, for **each** deliverable whose `status` changed — and each **newly added** deliverable — append one transition record to the append-only companion log `.claude/state-history.jsonl`:
+8. **Append to the deliverable-history log.** After the state.json `Edit` + `state-validate` pass, for **each** deliverable whose `status` changed — and each **newly added** deliverable — append one transition record to the append-only companion log `.claude/state-history.jsonl`:
 
    ```
-   bin/state-history append --id <deliverable_id> --from <old_status> --to <new_status>
+   state-history append --id <deliverable_id> --from <old_status> --to <new_status>
    ```
 
    Use `--from none` for a brand-new deliverable that had no prior status. (Optionally pass `--ts <iso>` / `--session <id>`; both default sensibly — `ts` to now-UTC, `session` to `$CLAUDE_SESSION_ID` or `"unknown"`.) The log is a **companion** to state.json — append-only, NOT part of `state.json`, and **NOT validated by `state-validate`**. It answers "which session moved deliverable X from in_progress → done, and when?"; surface it later via `where-am-i --history <id>`. Treat the append as **best-effort**: if it fails, do NOT roll back or block the state update — the state.json write is the source of truth; the history line is an audit augment. (The skill's `allowed-tools` already permits `Bash(state-history:*)`.)
@@ -62,7 +62,7 @@ Skip for trivial updates (typo fixes, single-line refactors). Trust the SessionS
 
 ## Schema reference
 
-Canonical schema in `SCHEMA.md` (`.claude/state.json` section). **Validate any write via `python bin/state-validate`** (stdlib-only checker; exit 0 = valid, 1 = errors). Quick reference:
+Canonical schema in `SCHEMA.md` (`.claude/state.json` section). **Validate any write via `state-validate`** (stdlib-only checker; exit 0 = valid, 1 = errors). Quick reference:
 
 ```json
 {

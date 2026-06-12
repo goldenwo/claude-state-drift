@@ -111,8 +111,17 @@ The whole system revolves around one file, `.claude/state.json`:
   `deferred` / `blocked`).
 
 See [SCHEMA.md](SCHEMA.md) for the full schema, a copy-paste starter file, and the
-per-project `.claude/hooks-config.json` knobs. Validate any state file with the
-bundled `state-validate` tool.
+per-project `.claude/hooks-config.json` knobs.
+
+The plugin also bundles a few CLI tools, all on the Bash tool's `PATH` in any
+session while the plugin is enabled — just ask Claude to run them:
+
+- `state-validate` — schema-check a `state.json` (exit `0` = valid).
+- `where-am-i` — print the orientation block on demand (`--history <id>` shows a
+  deliverable's transition log).
+- `state-history` — append an entry to the per-project transition log.
+- `workflows` — a cross-repo board: one row per project with a `state.json`
+  (walks `~/dev` by default; override with `$WORKFLOWS_ROOT`).
 
 ## Requirements
 
@@ -125,8 +134,8 @@ bundled `state-validate` tool.
 ## Troubleshooting
 
 - **No orientation block at session start?** Your project has no `.claude/state.json`
-  (the plugin stays silent rather than nagging) or the file is invalid — run the
-  bundled `state-validate` to check it.
+  (the plugin stays silent rather than nagging) or the file is invalid — ask Claude
+  to run `state-validate` (bundled, on the Bash `PATH` while the plugin is enabled).
 - **Focus-check fires too often / not often enough?** Set the cadence in
   `.claude/hooks-config.json` — see [SCHEMA.md](SCHEMA.md).
 - **Does anything leave my machine?** No. All signals are computed from local files

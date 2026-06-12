@@ -89,7 +89,7 @@ ORIENT=$("$PYTHON_BIN" "$WHERE_AM_I" "$PROJECT_DIR" 2>/dev/null)
 SAFE_ORIENT="${ORIENT//</‹}"; SAFE_ORIENT="${SAFE_ORIENT//>/›}"
 
 # Wrap in a clear marker block for the model
-WRAPPED=$(printf '<state-tracking-orientation>\n%s\n</state-tracking-orientation>\n\nThis is the auto-injected orientation block from the claude-harness-toolkit plugin. Treat it as the source of truth for the project'\''s current objective + version + deliverables. Update via the `update-state` skill (when shipped) or by editing .claude/state.json directly after substantial work.' "$SAFE_ORIENT")
+WRAPPED=$(printf '<state-tracking-orientation>\n%s\n</state-tracking-orientation>\n\nThis is the auto-injected orientation block from the state-tracking plugin. Treat it as the source of truth for the project'\''s current objective + version + deliverables. Update via the `update-state` skill or by editing .claude/state.json directly after substantial work.' "$SAFE_ORIENT")
 
 jq -n --arg ctx "$WRAPPED" \
     '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'

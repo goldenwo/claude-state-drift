@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""state-history — append-only audit log writer for deliverable transitions (#67).
+"""state-history — append-only audit log writer for deliverable transitions.
 
 state.json carries `deliverables[]` but no record of *when* / *in which
 session* a deliverable moved between statuses. This writer appends one compact

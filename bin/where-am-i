@@ -13,7 +13,7 @@ Usage:
     where-am-i              # uses $CLAUDE_PROJECT_DIR or pwd
     where-am-i /path/to/repo
     where-am-i --json       # raw state.json passthrough
-    where-am-i --history <id>   # #67: append-only transition log for a deliverable
+    where-am-i --history <id>   # append-only transition log for a deliverable
     where-am-i --help
 
 Schema (SCHEMA.md is canonical):
@@ -378,7 +378,7 @@ def render(state: dict, root: Path) -> str:
 
 
 def render_history(root: Path, deliverable_id: str) -> str:
-    """#67: render the append-only transition log for one deliverable.
+    """Render the append-only transition log for one deliverable.
 
     Reads `.claude/state-history.jsonl` via `_state_lib.read_history` (which
     silently skips malformed/blank lines). Renders one compact line per
@@ -414,7 +414,7 @@ def main(argv: list[str]) -> int:
     json_mode = "--json" in argv
     args = [a for a in argv if a != "--json"]
 
-    # #67: --history <id> renders the append-only transition log for one
+    # --history <id> renders the append-only transition log for one
     # deliverable, then exits. It is independent of state.json (history is a
     # companion file), so it does not silent-skip when state.json is absent.
     if "--history" in args:
