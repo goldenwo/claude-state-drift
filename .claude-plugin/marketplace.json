@@ -8,8 +8,8 @@
     {
       "name": "claude-state-drift",
       "source": "./",
-      "description": "State-tracking + drift-mitigation for Claude Code. Maintains a .claude/state.json (objective / current_focus / deliverables) and surfaces it via a SessionStart orientation block, a UserPromptSubmit focus-check, and auto-staleness nudges — plus where-am-i / update-state / re-anchor commands and skills to keep long sessions anchored to their goal.",
-      "version": "0.1.0",
+      "description": "Keeps long Claude Code sessions anchored. Maintains a per-project .claude/state.json (objective / current focus / deliverables), prints a WHERE YOU ARE orientation block at session start, re-injects the goal as you work, and nudges when state goes stale — with /where-am-i, /update-state, and /re-anchor.",
+      "version": "0.1.1",
       "author": {
         "name": "goldenwo"
       }
