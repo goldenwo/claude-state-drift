@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.6-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.7-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -59,7 +59,7 @@ flowchart LR
     F --> W
     W -->|"commit lands"| C["state-track-commit<br/>spots deliverable transitions"]
     W -->|"session ends"| Z["state-staleness<br/>flags stale state"]
-    C --> U["/update-state<br/>reviewed edit, never auto-writes"]
+    C --> U["update-state command<br/>reviewed edit, never auto-writes"]
     Z --> U
     U --> S
 ```
@@ -68,7 +68,7 @@ flowchart LR
 - A `UserPromptSubmit` hook (`focus-check`) re-injects the objective on a cadence you
   can tune per project (`.claude/hooks-config.json`).
 - A `Stop` hook flags stale state; a `PostToolUse` hook notices commits whose subject
-  suggests a deliverable transition and points you at `/update-state`.
+  suggests a deliverable transition and points you at the `update-state` command.
 - Everything is computed from local files and local git.
 
 None of this needs you to do anything: install, drop in a `state.json`, and the
@@ -78,13 +78,18 @@ re-anchor skills on its own when it detects a finished deliverable or drift.
 ## Commands
 
 For when you want to check or change state deliberately rather than waiting for
-a hook:
+a hook. Plugin commands are always namespaced in the Claude Code CLI — type
+`/claude-state-drift:` and tab-complete:
 
 | Command | What it does |
 |---|---|
-| `/where-am-i` | Print the orientation block on demand — objective, focus, deliverable statuses, recent commits. |
-| `/update-state` | Draft an update to `state.json` from recent work and show the diff. Never auto-writes — you approve every change. |
-| `/re-anchor` | Audit the current session against the objective and report alignment: on-track, mild drift, or significant drift. |
+| `/claude-state-drift:where-am-i` | Print the orientation block on demand — objective, focus, deliverable statuses, recent commits. |
+| `/claude-state-drift:update-state` | Draft an update to `state.json` from recent work and show the diff. Never auto-writes — you approve every change. |
+| `/claude-state-drift:re-anchor` | Audit the current session against the objective and report alignment: on-track, mild drift, or significant drift. |
+
+Outside the CLI (e.g. the desktop app), typed plugin commands aren't supported —
+just ask in plain words ("where am I?", "update the project state", "are we still
+on track?") and Claude invokes the matching skill.
 
 ## With and without
 
