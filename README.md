@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/goldenwo/claude-state-drift)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.5-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -82,31 +82,6 @@ lives in a scrolling context window:
 | After a milestone commit | Nudge to record the transition in `state.json` | Project state lives only in git archaeology |
 | Next week's session | Picks up exactly where the file says you left off | Reconstruction from memory and scrollback |
 
-## With `/loop` and `/goal`
-
-Claude Code's loop primitives are session-scoped: `/goal` keeps a session iterating
-until a condition is met, `/loop` re-runs a prompt on a schedule — and both expire
-with the session. Neither writes anything to disk. `claude-state-drift` is the
-durable layer underneath:
-
-| Layer | Answers | Lives |
-|---|---|---|
-| `/loop` | when to run | the session |
-| `/goal` | when this run is done | the session |
-| `claude-state-drift` | what the project is trying to do, and where it left off | `.claude/state.json`, on disk |
-
-Patterns that compose well:
-
-- **Anchor a goal to state** — `/goal the invoice-preview-endpoint deliverable is
-  marked done in .claude/state.json`. The goal evaluator now checks something
-  durable and machine-validatable instead of transcript vibes, and completing the
-  goal leaves a record the next session reads.
-- **Loops inherit real state** — every fresh loop-driven session opens with the
-  WHERE YOU ARE block and records transitions via `/update-state` on the way out,
-  so iteration N+1 starts from the file, not from scrollback that no longer exists.
-- **Drift guard for unattended runs** — focus-check re-injects the objective every
-  few prompts, which matters most exactly when nobody is watching the loop work.
-
 ## Built with itself
 
 This plugin's own release pipeline was built while running the plugin — every
@@ -172,8 +147,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## About this repo
 
-This repo is generated: every byte — including the CI workflow — is built from a
-pinned commit of a private source toolkit (see `.build-provenance`), and CI verifies
-the tree byte-for-byte against a fresh rebuild on every push. **File issues here —
-they're read and acted on.** Fixes land in the source toolkit and ship in the next
-release, which is why pull requests against this repo can't be merged directly.
+**File issues here — they're read and acted on.** This repo is generated: every
+byte is built from a pinned source commit (see `.build-provenance`) and verified
+byte-for-byte by CI on every push. Fixes land in the source and ship in the next
+release, which is why pull requests can't be merged directly.
