@@ -43,7 +43,9 @@ actually caught?" without transcript mining):
 
 Shared flags:
     --ts        ISO 8601 timestamp; default = now (UTC, ...Z)
-    --session   session id; default = $CLAUDE_SESSION_ID, else "unknown"
+    --session   session id; default = $CLAUDE_CODE_SESSION_ID (the id Claude
+                Code exports, matching the telemetry hooks), then the legacy
+                $CLAUDE_SESSION_ID, else "unknown"
     --root      project root; default = $CLAUDE_PROJECT_DIR, else cwd
                 (a bare positional path is also accepted, matching where-am-i)
 
@@ -198,12 +200,21 @@ def main(argv):
 
     root = project_root(opts.get("root") or opts.get("_positional"))
 
-    # session id: --session > $CLAUDE_SESSION_ID > "unknown". The fallback
-    # keeps the writer non-fatal when no session id is available (e.g. invoked
-    # outside a Claude Code session).
+    # session id: --session > $CLAUDE_CODE_SESSION_ID > $CLAUDE_SESSION_ID >
+    # "unknown". CLAUDE_CODE_SESSION_ID is the id Claude Code actually exports
+    # into Bash-tool subprocesses (verified: it equals the `.session_id` the
+    # hooks read from their stdin payload), so a skill-written transition/event
+    # carries the SAME session id the telemetry hooks log — which is what makes
+    # the offline nudge->update conversion + staleness-resolution joins work.
+    # CLAUDE_SESSION_ID is kept as a legacy/forward-compat fallback; the bare
+    # "unknown" keeps the writer non-fatal outside a Claude Code session.
     session_id = opts["session"]
     if not session_id:
-        session_id = os.environ.get("CLAUDE_SESSION_ID") or "unknown"
+        session_id = (
+            os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or os.environ.get("CLAUDE_SESSION_ID")
+            or "unknown"
+        )
 
     try:
         if subcommand == "append":

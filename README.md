@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.8-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.9-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -172,7 +172,9 @@ session while the plugin is enabled — just ask Claude to run them:
 
 - `state-validate` — schema-check a `state.json` (exit `0` = valid).
 - `where-am-i` — print the orientation block on demand (`--history <id>` shows a
-  deliverable's transition log).
+  deliverable's transition log; `--stats` shows this project's own telemetry —
+  cost, activity, and nudge→update conversion — computed locally from the opt-in
+  hook log, when `CLAUDE_HOOK_LOG=1`).
 - `state-history` — append an entry to the per-project transition log.
 - `workflows` — a cross-repo board: one row per project with a `state.json`
   (walks `~/dev` by default; override with `$WORKFLOWS_ROOT`).

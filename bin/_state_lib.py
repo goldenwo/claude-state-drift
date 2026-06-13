@@ -258,6 +258,162 @@ def read_history(root, deliverable_id=None):
     return records
 
 
+# --- observability stats (csd-observability-stats) -------------------------
+#
+# Two append-only local logs feed the stats:
+#   .claude/.hook-log.jsonl    hook-fire telemetry (CLAUDE_HOOK_LOG=1, opt-in)
+#   .claude/state-history.jsonl deliverable transitions + re-anchor events
+# compute_stats() joins them by session id to derive HONEST OPERATIONAL
+# metrics (activity, cost, nudge->update conversion, staleness-resolution).
+# These are NOT an effectiveness measure — see compute_stats.__doc__.
+
+HOOK_LOG_FILENAME = ".hook-log.jsonl"
+_ORIENT_HOOK = "session-start-orient.sh"
+_FOCUS_HOOK = "focus-check.sh"
+_COMMIT_HOOK = "state-track-commit.sh"
+_STALENESS_HOOK = "state-staleness.sh"
+
+
+def hook_log_path(root):
+    """Return the .claude/.hook-log.jsonl path under `root`."""
+    return Path(root) / ".claude" / HOOK_LOG_FILENAME
+
+
+def read_hook_log(root):
+    """Read .claude/.hook-log.jsonl -> list of record dicts. Malformed/blank
+    lines are skipped SILENTLY (append-only telemetry — one corrupt line must
+    never crash a reader). [] if the file is absent or unreadable."""
+    try:
+        text = hook_log_path(root).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    records = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+def _percentile(values, pct):
+    """Nearest-rank percentile of a numeric list (pct 0..100). None if empty."""
+    if not values:
+        return None
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round((pct / 100.0) * (len(s) - 1)))))
+    return s[k]
+
+
+def compute_stats(hook_records, history_records, bytes_per_token=4):
+    """Honest OPERATIONAL stats from the two local logs.
+
+    Measures the plugin's own ACTIVITY and COST, plus two BEHAVIORAL bookkeeping
+    signals — nudge->update conversion and staleness-resolution. It is NOT an
+    effectiveness measure: drift that a re-injection prevented is unobservable,
+    so nothing here proves the plugin keeps a session on goal. Any published
+    figure is an operational receipt, never an efficacy claim; re-anchor
+    verdicts are self-assessment and must not be published as efficacy.
+
+    Joins are by session: hook-log `session` == history `session_id`. Records
+    with a missing or "unknown" session are excluded from joins (unattributable)
+    — which is why bin/state-history defaults the session to the real
+    CLAUDE_CODE_SESSION_ID, so skill-written updates join the telemetry.
+    """
+    emits = [r for r in hook_records if r.get("fired_emit") == 1]
+
+    def _emits_for(hook):
+        return [r for r in emits if r.get("hook") == hook]
+
+    orient = _emits_for(_ORIENT_HOOK)
+    focus = _emits_for(_FOCUS_HOOK)
+    commit_nudges = _emits_for(_COMMIT_HOOK)
+    staleness_nudges = _emits_for(_STALENESS_HOOK)
+
+    sessions = {r.get("session") for r in emits if r.get("session")}
+    sessions.discard("unknown")
+    ts_all = [r.get("ts") for r in emits if r.get("ts")]
+    span = (min(ts_all), max(ts_all)) if ts_all else (None, None)
+
+    def _ctx_tokens(recs):
+        vals = [r["ctx_bytes"] for r in recs
+                if isinstance(r.get("ctx_bytes"), (int, float))]
+        if not vals:
+            return None
+        return {"p50_tokens": round(_percentile(vals, 50) / bytes_per_token),
+                "p95_tokens": round(_percentile(vals, 95) / bytes_per_token),
+                "n": len(vals)}
+
+    # Index transitions by session -> sorted parsed timestamps for the join.
+    by_session = {}
+    for r in history_records:
+        if not r.get("deliverable_id"):
+            continue
+        sid, dt = r.get("session_id"), parse_iso(r.get("ts"))
+        if not sid or sid == "unknown" or dt is None:
+            continue
+        by_session.setdefault(sid, []).append(dt)
+    for sid in by_session:
+        by_session[sid].sort()
+
+    def _first_followup(session, after_dt):
+        if after_dt is None:
+            return None
+        for dt in by_session.get(session, ()):
+            if dt >= after_dt:
+                return dt
+        return None
+
+    conv_total = conv_converted = 0
+    for r in commit_nudges:
+        sid = r.get("session")
+        if not sid or sid == "unknown":
+            continue
+        conv_total += 1
+        if _first_followup(sid, parse_iso(r.get("ts"))):
+            conv_converted += 1
+
+    res_deltas_min = []
+    stale_total = stale_resolved = 0
+    for r in staleness_nudges:
+        sid, nudge_dt = r.get("session"), parse_iso(r.get("ts"))
+        if not sid or sid == "unknown" or nudge_dt is None:
+            continue
+        stale_total += 1
+        follow = _first_followup(sid, nudge_dt)
+        if follow:
+            stale_resolved += 1
+            res_deltas_min.append((follow - nudge_dt).total_seconds() / 60.0)
+
+    verdicts = {}
+    for r in history_records:
+        if r.get("event") == "re-anchor":
+            v = r.get("verdict", "?")
+            verdicts[v] = verdicts.get(v, 0) + 1
+
+    return {
+        "sessions": len(sessions),
+        "span": span,
+        "activity": {"orientations": len(orient),
+                     "focus_reinjections": len(focus),
+                     "commit_nudges": len(commit_nudges),
+                     "staleness_nudges": len(staleness_nudges)},
+        "cost": {"orientation": _ctx_tokens(orient), "focus": _ctx_tokens(focus)},
+        "conversion": {"total": conv_total, "converted": conv_converted,
+                       "rate": (conv_converted / conv_total) if conv_total else None},
+        "staleness_resolution": {
+            "total": stale_total, "resolved": stale_resolved,
+            "median_minutes": (_percentile(res_deltas_min, 50)
+                               if res_deltas_min else None)},
+        "reanchor_verdicts": verdicts,
+    }
+
+
 def _cli(argv):
     """Tiny CLI for bash hooks (state-staleness.sh and similar).
 

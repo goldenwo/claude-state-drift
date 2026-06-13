@@ -14,6 +14,8 @@ Usage:
     where-am-i /path/to/repo
     where-am-i --json       # raw state.json passthrough
     where-am-i --history <id>   # append-only transition log for a deliverable
+    where-am-i --stats          # operational telemetry (cost/activity/conversion)
+    where-am-i --stats --json   # same, machine-readable
     where-am-i --help
 
 Schema (SCHEMA.md is canonical):
@@ -47,9 +49,11 @@ from pathlib import Path
 
 from _state_lib import (  # noqa: E402
     compute_lag_days,
+    compute_stats,
     history_path,
     normalize_version,
     read_history,
+    read_hook_log,
     relative_age as _relative_age,
     resolve_staleness_hours,
 )
@@ -406,6 +410,56 @@ def render_history(root: Path, deliverable_id: str) -> str:
     return "\n".join(lines)
 
 
+def render_stats(root) -> str:
+    """Render the operational-stats block for one project from its two local
+    logs (.claude/.hook-log.jsonl + .claude/state-history.jsonl). Honest about
+    scope: activity + cost + bookkeeping conversion, explicitly NOT efficacy."""
+    hook_records = read_hook_log(root)
+    history = read_history(root)
+    s = compute_stats(hook_records, history)
+    out = ["=== STATE-DRIFT STATS ===", f"Project: {root.name or root}"]
+    if not hook_records:
+        out.append("  (no telemetry yet — set CLAUDE_HOOK_LOG=1 and run sessions)")
+        return "\n".join(out)
+    lo, hi = s["span"]
+    if lo and hi:
+        out.append(f"Window: {lo} .. {hi}  ({s['sessions']} session(s))")
+    a = s["activity"]
+    out += ["", "Activity (operational — what fired):",
+            f"  Orientations:        {a['orientations']}",
+            f"  Focus re-injections: {a['focus_reinjections']}",
+            f"  Commit nudges:       {a['commit_nudges']}",
+            f"  Staleness nudges:    {a['staleness_nudges']}"]
+    c = s["cost"]
+    out += ["", "Cost (~tokens, ctx_bytes/4 estimate):"]
+    if c["orientation"]:
+        o = c["orientation"]
+        out.append(f"  Orientation: ~{o['p50_tokens']} p50 / ~{o['p95_tokens']} p95  (once per session)")
+    if c["focus"]:
+        fo = c["focus"]
+        out.append(f"  Focus re-injection: ~{fo['p50_tokens']} p50 / ~{fo['p95_tokens']} p95")
+    conv, sr = s["conversion"], s["staleness_resolution"]
+    out += ["", "Behavioral (bookkeeping — did nudges land):"]
+    if conv["rate"] is not None:
+        out.append(f"  Commit-nudge -> state update: {conv['converted']}/{conv['total']} "
+                   f"({round(conv['rate'] * 100)}%)")
+    else:
+        out.append("  Commit-nudge -> state update: no attributable nudges yet")
+    if sr["resolved"]:
+        out.append(f"  Staleness resolved: {sr['resolved']}/{sr['total']}, "
+                   f"median ~{round(sr['median_minutes'])} min to next update")
+    else:
+        out.append(f"  Staleness resolved: 0/{sr['total']}")
+    if s["reanchor_verdicts"]:
+        dist = ", ".join(f"{k}:{n}" for k, n in sorted(s["reanchor_verdicts"].items()))
+        out += ["", f"Re-anchor verdicts (SELF-ASSESSED — not a publishable efficacy stat): {dist}"]
+    out += ["",
+            "Operational metrics only — not an effectiveness measure. Drift a",
+            "re-injection prevented is unobservable; efficacy needs the controlled",
+            "with/without experiment."]
+    return "\n".join(out)
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] in ("--help", "-h"):
         print(__doc__)
@@ -413,6 +467,18 @@ def main(argv: list[str]) -> int:
 
     json_mode = "--json" in argv
     args = [a for a in argv if a != "--json"]
+
+    # --stats renders this project's operational telemetry (cost, activity,
+    # nudge->update conversion, staleness-resolution) from the two local logs.
+    if "--stats" in args:
+        rest = [a for a in args if a != "--stats"]
+        root = project_root(rest[0] if rest else None)
+        if json_mode:
+            print(json.dumps(compute_stats(read_hook_log(root), read_history(root)),
+                             indent=2))
+        else:
+            print(render_stats(root))
+        return 0
 
     # --history <id> renders the append-only transition log for one
     # deliverable, then exits. It is independent of state.json (history is a
