@@ -13,6 +13,16 @@
 # Record shape (one JSON object per line):
 #     {"hook":"focus-check.sh","ts":"2026-05-11T12:34:56Z","duration_ms":12,"fired_emit":1}
 #
+# Optional enrichment (csd-observability-stats): a hook may set TELEM_EXTRA
+# to a pre-formatted JSON fragment of additional key:value pairs (no leading
+# comma), e.g.:
+#     TELEM_EXTRA='"counter":12,"ctx_bytes":744'
+# The fragment is appended into the record verbatim AFTER a charset
+# whitelist check (values are internally generated — validated ints, git
+# short-SHAs — never user text; the whitelist is defense-in-depth so one
+# bad value can't corrupt the JSONL). On any unexpected character the
+# fragment is dropped and the base record still writes.
+#
 # Configuration:
 #     CLAUDE_HOOK_LOG=1                — enable (default: disabled, no-op)
 #     CLAUDE_HOOK_LOG_MAX_BYTES=N      — size cap (default: 10485760 = 10MB)
@@ -97,10 +107,30 @@ telem_end() {
         *) fired_emit=0 ;;
     esac
 
+    # Optional TELEM_EXTRA enrichment fragment (see header). Whitelist:
+    # letters, digits, underscore, quote, colon, comma, dot, space, hyphen.
+    # Must start with a quoted key. Anything else drops the fragment —
+    # the base record is never at risk from a malformed enrichment.
+    local extra="${TELEM_EXTRA:-}"
+    if [ -n "$extra" ]; then
+        case "$extra" in
+            \"*) case "$extra" in
+                     *[!A-Za-z0-9_:,.\"\ -]*) extra="" ;;
+                 esac ;;
+            *) extra="" ;;
+        esac
+    fi
+
     # Append JSONL line. POSIX small-write atomicity for lines under PIPE_BUF
     # (typically 4096) means concurrent appends from parallel hooks don't
-    # interleave. Our record is ~100 bytes — well under.
-    printf '{"hook":"%s","ts":"%s","duration_ms":%d,"fired_emit":%s}\n' \
-        "$hook" "$ts" "$duration_ms" "$fired_emit" \
-        >> "$log_file" 2>/dev/null || true
+    # interleave. Our record is ~100 bytes (~150 with enrichment) — well under.
+    if [ -n "$extra" ]; then
+        printf '{"hook":"%s","ts":"%s","duration_ms":%d,"fired_emit":%s,%s}\n' \
+            "$hook" "$ts" "$duration_ms" "$fired_emit" "$extra" \
+            >> "$log_file" 2>/dev/null || true
+    else
+        printf '{"hook":"%s","ts":"%s","duration_ms":%d,"fired_emit":%s}\n' \
+            "$hook" "$ts" "$duration_ms" "$fired_emit" \
+            >> "$log_file" 2>/dev/null || true
+    fi
 }

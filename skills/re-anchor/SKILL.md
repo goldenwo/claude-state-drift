@@ -1,7 +1,7 @@
 ---
 name: re-anchor
 description: Drift-mitigation skill. Re-reads the project's master objective from `.claude/state.json` and audits the current session's recent work for alignment. Use after a long stretch (>30 minutes of intensive work, or many tool calls without checking back), when noticing scope drift, before declaring a task done, or when the user asks to "re-anchor", "check we're on track", "sanity check direction", "are we still on the right path". Reports a short alignment audit; does not modify state.
-allowed-tools: Read, Bash(git log:*), Bash(git status), Bash(where-am-i:*), Bash(python:*)
+allowed-tools: Read, Bash(git log:*), Bash(git status), Bash(where-am-i:*), Bash(python:*), Bash(state-history:*)
 ---
 
 # re-anchor
@@ -16,7 +16,7 @@ Pause, re-read the master objective, audit the current session's recent work for
 - On user request: "re-anchor", "check we're on track", "are we still on the right path", "sanity check direction".
 - After resuming a session that was paused for hours/days.
 
-This skill is read-only and side-effect-free. It does NOT modify state.json — that's `update-state`'s job.
+This skill does NOT modify state.json — that's `update-state`'s job. Its only write is one verdict line appended to the `state-history.jsonl` audit log (step 4).
 
 ## Procedure
 
@@ -44,7 +44,15 @@ This skill is read-only and side-effect-free. It does NOT modify state.json — 
    - <one to three concrete next moves>
    ```
 
-4. **Stop. Print the audit.** Do not auto-update state.json — if changes are warranted, the user invokes `update-state` next.
+4. **Log the verdict.** Append the drift verdict to the project's append-only audit log so accumulated logs can answer "how often is drift actually caught?":
+
+   ```
+   state-history event --type re-anchor --verdict <on-track|mild|significant>
+   ```
+
+   (`state-history` is on PATH while the plugin is enabled.) This is the audit log, not state.json — the no-auto-writes contract is untouched. If the command fails, say so and continue; the audit itself is the deliverable.
+
+5. **Stop. Print the audit.** Do not auto-update state.json — if changes are warranted, the user invokes `update-state` next.
 
 ## Drift patterns to look for
 
@@ -56,7 +64,7 @@ This skill is read-only and side-effect-free. It does NOT modify state.json — 
 
 ## What this skill does NOT do
 
-- Does not modify state.json. Use `update-state` for that.
+- Does not modify state.json. Use `update-state` for that. (The verdict line in `state-history.jsonl` is the audit log, not project state.)
 - Does not undo work or roll back changes. The audit is informational.
 - Does not interrupt the session — it's invoked on demand or at the agent's own initiative.
 - Does not replace tests/lint/CI. Those check correctness; this checks alignment.

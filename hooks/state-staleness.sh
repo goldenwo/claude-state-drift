@@ -136,6 +136,17 @@ BLOCK=$(printf '<state-staleness>\n.claude/state.json is stale:\n  last_updated:
 
 [ -n "$NUDGE_FILE" ] && touch "$NUDGE_FILE" 2>/dev/null
 
+# Observability enrichment (csd-observability-stats): record HOW STALE the
+# anchor was when flagged (lag_hours) + how many commits the work was ahead of
+# state (commits_ahead). This is the most directly GOAL-aligned signal — a
+# user-facing --stats view surfaces "your state.json was N hours / M commits
+# behind your actual work", which is actionable (go re-anchor) rather than a
+# vanity activity count. LAG_HOURS/COMMITS_AHEAD are validated integers here
+# (past the sentinel + threshold gates); session id sanitized to the
+# whitelist-safe charset. Emit-path only — Stop fires once per session-end.
+SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+TELEM_EXTRA=$(printf '"lag_hours":%s,"commits_ahead":%s,"session":"%s"' "$LAG_HOURS" "$COMMITS_AHEAD" "$SAFE_SID")
+
 TELEM_EMIT=1   # F-prep.3 telemetry: actual staleness nudge emission
 jq -n --arg ctx "$BLOCK" \
     '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}'

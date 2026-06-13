@@ -219,6 +219,20 @@ SAFE_FOCUS=$(printf '%s' "$SAFE_FOCUS" | tr -s '\r\n' ' ')
 BLOCK=$(printf '<focus-check>\nObjective: %s\nCurrent focus: %s\nProject version: %s\nYou are %d turns into this session. Verify your next action serves the focus before proceeding. If it does not, reconsider scope or invoke the re-anchor skill (or /re-anchor).\n</focus-check>' \
     "${SAFE_OBJECTIVE}" "${SAFE_FOCUS}" "${VERSION}" "${COUNTER}")
 
+# Observability enrichment (csd-observability-stats): record WHEN the
+# intervention fired (turn counter) and HOW BIG the injected block is
+# (bytes), so accumulated telemetry can answer "when does drift prevention
+# happen?" and "what does it cost per session?" without transcript mining.
+# Emit-path only (every Nth prompt) — the silent-skip hot path never pays
+# the extra wc spawn. COUNTER is already validated numeric above.
+CTX_BYTES=$(printf '%s' "${BLOCK}" | wc -c 2>/dev/null | tr -d '[:space:]')
+case "${CTX_BYTES}" in ''|*[!0-9]*) CTX_BYTES=0 ;; esac
+# session id (sanitized to whitelist-safe charset) lets offline analysis
+# count distinct sessions and join focus-check activity to the same
+# session's state-history transitions.
+SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+TELEM_EXTRA=$(printf '"counter":%d,"ctx_bytes":%s,"session":"%s"' "${COUNTER}" "${CTX_BYTES}" "${SAFE_SID}")
+
 TELEM_EMIT=1   # F-prep.3 telemetry: distinguish actual-emit from silent-skip paths
 jq -n --arg ctx "${BLOCK}" \
     '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}}'

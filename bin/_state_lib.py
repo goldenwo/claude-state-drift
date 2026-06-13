@@ -195,6 +195,39 @@ def append_history(root, deliverable_id, from_status, to_status,
     return record
 
 
+def append_event(root, event_type, verdict=None, ts=None, session_id=None):
+    """Append one non-transition EVENT record to .claude/state-history.jsonl.
+
+    Observability companion to append_history (csd-observability-stats):
+    durable session events — today only re-anchor drift verdicts — share the
+    transition log's append-only file. Event records carry an `event` key and
+    NO `deliverable_id`, so the `where-am-i --history <id>` read path
+    (read_history with a deliverable_id filter) skips them naturally; offline
+    stats miners select on `event` instead. Record shape:
+
+        {"event":"re-anchor","verdict":"mild","ts":"...Z","session_id":"..."}
+
+    `verdict` is optional at this layer (domain validation is the CLI's job —
+    bin/state-history owns the accepted event types and verdict values).
+    Returns the record dict that was written.
+    """
+    if ts is None:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if session_id is None:
+        session_id = "unknown"
+    record = {"event": event_type}
+    if verdict is not None:
+        record["verdict"] = verdict
+    record["ts"] = ts
+    record["session_id"] = session_id
+    path = history_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    return record
+
+
 def read_history(root, deliverable_id=None):
     """Read .claude/state-history.jsonl, newest record last (file order).
 

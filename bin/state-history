@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""state-history — append-only audit log writer for deliverable transitions.
+"""state-history — append-only audit log writer for deliverable transitions
+and durable session events (re-anchor drift verdicts).
 
 state.json carries `deliverables[]` but no record of *when* / *in which
 session* a deliverable moved between statuses. This writer appends one compact
 JSON line per transition to the COMPANION file `<root>/.claude/state-history.jsonl`:
 
     {"deliverable_id": "...", "from": "...", "to": "...",
+     "ts": "<ISO8601 UTC ...Z>", "session_id": "..."}
+
+Event records (the `event` subcommand) share the same file but carry an
+`event` key and no `deliverable_id`, so the `where-am-i --history <id>`
+read path skips them naturally:
+
+    {"event": "re-anchor", "verdict": "on-track|mild|significant",
      "ts": "<ISO8601 UTC ...Z>", "session_id": "..."}
 
 The log is APPEND-ONLY — an audit trail. It is deliberately NOT part of
@@ -19,11 +27,21 @@ orientation CLI never mutates project state.
 Usage:
     state-history append --id <deliverable_id> --from <status> --to <status>
                          [--ts <iso>] [--session <id>] [--root <path>] [<path>]
+    state-history event  --type re-anchor --verdict <on-track|mild|significant>
+                         [--ts <iso>] [--session <id>] [--root <path>] [<path>]
 
-Flags:
+`append` flags:
     --id        deliverable id (required)
     --from      previous status, or "none" for a brand-new deliverable (required)
     --to        new status (required)
+
+`event` flags (csd-observability-stats — durable session events; today only
+re-anchor drift verdicts, so accumulated logs can answer "how often is drift
+actually caught?" without transcript mining):
+    --type      event type; accepted: re-anchor (required)
+    --verdict   drift verdict; accepted: on-track | mild | significant (required)
+
+Shared flags:
     --ts        ISO 8601 timestamp; default = now (UTC, ...Z)
     --session   session id; default = $CLAUDE_SESSION_ID, else "unknown"
     --root      project root; default = $CLAUDE_PROJECT_DIR, else cwd
@@ -39,7 +57,7 @@ import os
 import sys
 from pathlib import Path
 
-from _state_lib import append_history  # noqa: E402
+from _state_lib import append_event, append_history  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -102,21 +120,77 @@ def _parse_append(argv):
     return opts
 
 
+# Domain tables for the `event` subcommand. Curated on purpose: the history
+# file is an audit log, and an open-ended event namespace would turn it into
+# a junk drawer. Extend deliberately, one reviewed type at a time.
+EVENT_TYPES = ("re-anchor",)
+REANCHOR_VERDICTS = ("on-track", "mild", "significant")
+
+
+def _parse_event(argv):
+    """Parse the `event` subcommand argv. Returns a dict on success, or None
+    on a usage error (after printing a stderr message)."""
+    opts = {"type": None, "verdict": None, "ts": None,
+            "session": None, "root": None}
+    positional = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--type", "--verdict", "--ts", "--session", "--root"):
+            val, nxt = _take_value(argv, i, a)
+            if val is None:
+                return None
+            opts[a[2:]] = val
+            i = nxt
+        elif a in ("--help", "-h"):
+            print(__doc__)
+            return {"_help": True}
+        elif a.startswith("--"):
+            print(f"state-history: unknown flag: {a}", file=sys.stderr)
+            return None
+        else:
+            positional = a
+            i += 1
+    opts["_positional"] = positional
+
+    if opts["type"] not in EVENT_TYPES:
+        print(
+            "state-history event: --type is required and must be one of: "
+            + ", ".join(EVENT_TYPES),
+            file=sys.stderr,
+        )
+        return None
+    if opts["verdict"] not in REANCHOR_VERDICTS:
+        print(
+            "state-history event: --verdict is required and must be one of: "
+            + ", ".join(REANCHOR_VERDICTS),
+            file=sys.stderr,
+        )
+        return None
+    return opts
+
+
 def main(argv):
     if argv and argv[0] in ("--help", "-h"):
         print(__doc__)
         return 0
 
-    if not argv or argv[0] != "append":
+    if not argv or argv[0] not in ("append", "event"):
         print(
             "state-history: usage: state-history append --id <id> "
             "--from <status> --to <status> [--ts <iso>] [--session <id>] "
-            "[--root <path>]",
+            "[--root <path>]  |  state-history event --type re-anchor "
+            "--verdict <on-track|mild|significant> [--ts <iso>] "
+            "[--session <id>] [--root <path>]",
             file=sys.stderr,
         )
         return 2
 
-    opts = _parse_append(argv[1:])
+    subcommand = argv[0]
+    if subcommand == "append":
+        opts = _parse_append(argv[1:])
+    else:
+        opts = _parse_event(argv[1:])
     if opts is None:
         return 2
     if opts.get("_help"):
@@ -132,19 +206,31 @@ def main(argv):
         session_id = os.environ.get("CLAUDE_SESSION_ID") or "unknown"
 
     try:
-        rec = append_history(
-            root,
-            opts["id"],
-            opts["from"],
-            opts["to"],
-            ts=opts["ts"],
-            session_id=session_id,
-        )
+        if subcommand == "append":
+            rec = append_history(
+                root,
+                opts["id"],
+                opts["from"],
+                opts["to"],
+                ts=opts["ts"],
+                session_id=session_id,
+            )
+        else:
+            rec = append_event(
+                root,
+                opts["type"],
+                verdict=opts["verdict"],
+                ts=opts["ts"],
+                session_id=session_id,
+            )
     except OSError as e:
         print(f"state-history: failed to append history: {e}", file=sys.stderr)
         return 1
 
-    print(f"{rec['deliverable_id']}: {rec['from']} → {rec['to']} ({rec['ts']})")
+    if subcommand == "append":
+        print(f"{rec['deliverable_id']}: {rec['from']} → {rec['to']} ({rec['ts']})")
+    else:
+        print(f"{rec['event']}: {rec['verdict']} ({rec['ts']})")
     return 0
 
 

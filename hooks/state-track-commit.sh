@@ -238,6 +238,20 @@ BLOCK=$(printf '<state-update-nudge>\nCommit %s just landed:\n  %s\n\nSubject su
 
 [ -n "$NUDGE_FILE" ] && printf '%s\n' "$LATEST_COMMIT" > "$NUDGE_FILE" 2>/dev/null
 
+# Observability enrichment (csd-observability-stats): record WHICH commit
+# was nudged about (short SHA, hex from git — safe for the JSON fragment)
+# and the injected block size. The SHA lets offline analysis tie a nudge
+# to whether state.json was updated afterwards (the nudge→update
+# conversion rate). Emit-path only — real nudges are rare.
+CTX_BYTES=$(printf '%s' "$BLOCK" | wc -c 2>/dev/null | tr -d '[:space:]')
+case "$CTX_BYTES" in ''|*[!0-9]*) CTX_BYTES=0 ;; esac
+# session id (sanitized) is the clean join key for the nudge→update
+# conversion metric: state-history transitions carry session_id, so a nudge
+# and a subsequent same-session state update can be matched without noisy
+# time-proximity heuristics.
+SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+TELEM_EXTRA=$(printf '"commit":"%s","ctx_bytes":%s,"session":"%s"' "${LATEST_COMMIT:0:7}" "$CTX_BYTES" "$SAFE_SID")
+
 TELEM_EMIT=1   # F-prep.3 telemetry: actual nudge emission
 jq -n --arg ctx "$BLOCK" \
     '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $ctx}}'

@@ -16,6 +16,20 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     exit 0
 fi
 
+# Observability telemetry (csd-observability-stats): instrument the
+# orientation hook so accumulated logs capture the DOMINANT per-session
+# context cost — the orientation block itself — which was previously
+# uninstrumented (only focus-check / state-track / staleness emitted
+# telemetry). Sourced before the early-exit checks so the silent-skip fast
+# path is measured too; a no-op unless CLAUDE_HOOK_LOG=1. TELEM_EMIT flips
+# to 1 only when the block is actually injected. The trap reads PROJECT_DIR
+# at exit time (set below); for the rare pre-resolution exit it falls back
+# to the env cwd, matching where telemetry would be written anyway.
+# shellcheck disable=SC1091
+source "$(dirname "$0")/_telemetry.sh"
+telem_start
+trap 'telem_end session-start-orient.sh "${TELEM_EMIT:-0}" "${PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"' EXIT
+
 if ! command -v jq >/dev/null 2>&1; then
     # Fail-open: missing jq shouldn't bork session start
     exit 0
@@ -32,6 +46,7 @@ ensure_python || exit 0
 HOOK_INPUT="$(cat)"
 PROJECT_DIR=$(echo "$HOOK_INPUT" | jq -r '.cwd // empty')
 [[ -n "$PROJECT_DIR" ]] || PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+SESSION_ID=$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // .sessionId // ""' 2>/dev/null)
 
 # Periodic cleanup of stale tracker files (>7 days old) from $TMPDIR so they
 # don't accumulate forever. Covers focus-check counters + warn markers,
@@ -90,6 +105,17 @@ SAFE_ORIENT="${ORIENT//</‹}"; SAFE_ORIENT="${SAFE_ORIENT//>/›}"
 
 # Wrap in a clear marker block for the model
 WRAPPED=$(printf '<state-tracking-orientation>\n%s\n</state-tracking-orientation>\n\nThis is the auto-injected orientation block from the state-tracking plugin. Treat it as the source of truth for the project'\''s current objective + version + deliverables. Update via the `update-state` skill or by editing .claude/state.json directly after substantial work.' "$SAFE_ORIENT")
+
+# Observability enrichment: record the injected orientation size (the
+# dominant per-session context cost) + session id, so accumulated logs can
+# report a real per-session cost distribution and count distinct sessions /
+# join to state-history transitions. session id is sanitized to a
+# whitelist-safe charset so a malformed id can never corrupt the JSONL.
+CTX_BYTES=$(printf '%s' "$WRAPPED" | wc -c 2>/dev/null | tr -d '[:space:]')
+case "$CTX_BYTES" in ''|*[!0-9]*) CTX_BYTES=0 ;; esac
+SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+TELEM_EXTRA=$(printf '"ctx_bytes":%s,"session":"%s"' "$CTX_BYTES" "$SAFE_SID")
+TELEM_EMIT=1
 
 jq -n --arg ctx "$WRAPPED" \
     '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'

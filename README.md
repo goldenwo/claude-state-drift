@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.7-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.8-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -102,6 +102,39 @@ lives in a scrolling context window:
 | 40 prompts in | Objective re-injected on a cadence; still in context | Goal relies on whatever survived context compaction |
 | After a milestone commit | Nudge to record the transition in `state.json` | Project state lives only in git archaeology |
 | Next week's session | Picks up exactly where the file says you left off | Reconstruction from memory and scrollback |
+
+## What it costs
+
+A tool that fights context rot only earns its keep if it isn't itself context
+bloat. It isn't — and almost all of the cost is paid once, at session start:
+
+| Injection | When | Typical size |
+|---|---|---|
+| Orientation block | once, at session start | ~700–2,000 tokens |
+| Focus re-injection | every 6th prompt (tunable) | ~180 tokens |
+
+For a typical long session that's roughly **1,000–4,000 tokens total — under 1–2%
+of a 200K window** — and most of it is the one-time orientation block, which
+prompt-caches with the rest of your session prefix. The only recurring cost, the
+focus re-injection, is smaller than a single file read.
+
+Two things keep it bounded:
+
+- The focus re-injection is length-capped, so it can't grow without limit.
+- The orientation block scales with what *you* put in `state.json` — a
+  one-sentence `current_focus` keeps it near the low end. You're in control.
+
+Tune the cadence or disable any of it per project in `.claude/hooks-config.json`
+(see [SCHEMA.md](SCHEMA.md)). Nothing is measured remotely: the optional
+`CLAUDE_HOOK_LOG=1` writes a local `.claude/.hook-log.jsonl` and nothing leaves
+your machine. For scale, that per-session cost is in the same range as a lean
+project `CLAUDE.md`, and a small fraction of what one MCP server's tool
+definitions cost you on every turn.
+
+(Token counts measured with a GPT-family tokenizer as a proxy; Claude's own
+tokenizer differs by ~±15%. Numbers are for typical projects — a verbose
+`state.json` costs more, which is why the `current_focus` field is meant to stay
+short.)
 
 ## Built with itself
 
