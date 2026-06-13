@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.9-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.10-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -49,7 +49,7 @@ Then drop a starter `.claude/state.json` into your project — copy one from
 
 ## How it works
 
-Four hooks — all automatic — and three optional commands, all reading one file:
+Four hooks — all automatic — and four optional commands, all reading one file:
 
 ```mermaid
 flowchart LR
@@ -86,6 +86,7 @@ a hook. Plugin commands are always namespaced in the Claude Code CLI — type
 | `/claude-state-drift:where-am-i` | Print the orientation block on demand — objective, focus, deliverable statuses, recent commits. |
 | `/claude-state-drift:update-state` | Draft an update to `state.json` from recent work and show the diff. Never auto-writes — you approve every change. |
 | `/claude-state-drift:re-anchor` | Audit the current session against the objective and report alignment: on-track, mild drift, or significant drift. |
+| `/claude-state-drift:stats` | Show this project's own telemetry — sessions, per-injection token cost, activity, and nudge→update conversion — computed locally (needs `CLAUDE_HOOK_LOG=1`). |
 
 Outside the CLI (e.g. the desktop app), typed plugin commands aren't supported —
 just ask in plain words ("where am I?", "update the project state", "are we still
