@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.11-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.12-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -67,8 +67,10 @@ flowchart LR
 - A `SessionStart` hook prints the orientation block.
 - A `UserPromptSubmit` hook (`focus-check`) re-injects the objective on a cadence you
   can tune per project (`.claude/hooks-config.json`).
-- A `Stop` hook flags stale state; a `PostToolUse` hook notices commits whose subject
-  suggests a deliverable transition and points you at the `update-state` command.
+- A `Stop` hook flags stale state (and nudges you to run `state-gc` once enough old
+  `done` deliverables pile up — it only flags, never auto-edits); a `PostToolUse` hook
+  notices commits whose subject suggests a deliverable transition and points you at
+  the `update-state` command.
 - Everything is computed from local files and local git.
 
 None of this needs you to do anything: install, drop in a `state.json`, and the
