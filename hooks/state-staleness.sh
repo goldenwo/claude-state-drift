@@ -5,9 +5,9 @@
 #   1. STALENESS — state.json's last_updated lags HEAD commit time by >N hours
 #      AND HEAD is >M commits ahead → nudge to invoke update-state. Both
 #      thresholds must hold (avoids noise on routine sessions).
-#   2. BLOAT (state-archive auto-nudge) — state.json has >=K archivable `done`
+#   2. BLOAT (state-clean auto-nudge) — state.json has >=K archivable `done`
 #      deliverables (old, never rendered in orientation = pure disk weight) →
-#      nudge to run `state-archive --apply`. Keeps the file lean WITHOUT auto-mutating
+#      nudge to run `state-clean --apply`. Keeps the file lean WITHOUT auto-mutating
 #      it (the plugin is "nudge, never auto-write"): the hook only flags; the
 #      human/agent runs the archive.
 #
@@ -20,8 +20,8 @@
 #   STATE_STALENESS_DISABLE=1   — master kill: disable the ENTIRE hook
 #   STATE_STALENESS_HOURS=N     — staleness lag threshold in hours (default 24)
 #   STATE_STALENESS_COMMITS=N   — staleness commits-since threshold (default 3)
-#   STATE_ARCHIVE_NUDGE_DISABLE=1    — disable ONLY the bloat half
-#   STATE_ARCHIVE_NUDGE_MIN=K        — archivable-deliverable threshold (default 25)
+#   STATE_CLEAN_NUDGE_DISABLE=1    — disable ONLY the bloat half
+#   STATE_CLEAN_NUDGE_MIN=K        — archivable-deliverable threshold (default 25)
 
 set +e
 
@@ -115,17 +115,17 @@ _compute_stale() {
 }
 _compute_stale
 
-# --- Bloat half (state-archive auto-nudge): ask state-archive (DRY-RUN) how many `done`
+# --- Bloat half (state-clean auto-nudge): ask state-clean (DRY-RUN) how many `done`
 # deliverables are archivable; nudge if it crosses the threshold. The hook NEVER
-# archives — it only flags; the human/agent runs `state-archive --apply`. ---
+# archives — it only flags; the human/agent runs `state-clean --apply`. ---
 BLOAT_BLOCK=""
-if [ "${STATE_ARCHIVE_NUDGE_DISABLE:-0}" != "1" ]; then
-    NUDGE_MIN="${STATE_ARCHIVE_NUDGE_MIN:-25}"
-    STATE_ARCHIVE="$(dirname "$0")/../bin/state-archive"
-    ARCHIVABLE=$("$PYTHON" "$STATE_ARCHIVE" "$CWD" --json 2>/dev/null | jq -r '.archivable // 0' 2>/dev/null)
+if [ "${STATE_CLEAN_NUDGE_DISABLE:-0}" != "1" ]; then
+    NUDGE_MIN="${STATE_CLEAN_NUDGE_MIN:-25}"
+    STATE_CLEAN="$(dirname "$0")/../bin/state-clean"
+    ARCHIVABLE=$("$PYTHON" "$STATE_CLEAN" "$CWD" --json 2>/dev/null | jq -r '.archivable // 0' 2>/dev/null)
     [ -z "$ARCHIVABLE" ] && ARCHIVABLE=0
     if [ "$ARCHIVABLE" -ge "$NUDGE_MIN" ] 2>/dev/null; then
-        BLOAT_BLOCK=$(printf '<state-bloat>\n.claude/state.json has %d done deliverable(s) old enough to archive (never shown in orientation -- pure disk weight).\nRun the `/claude-state-drift:archive` command (it dry-runs, confirms, then archives to an append-only .claude/state-archive.jsonl -- lossless; git is the backstop), or `state-archive --apply` directly. Tune via STATE_ARCHIVE_NUDGE_MIN (default 25); disable via STATE_ARCHIVE_NUDGE_DISABLE=1.\n</state-bloat>' "$ARCHIVABLE")
+        BLOAT_BLOCK=$(printf '<state-bloat>\n.claude/state.json has %d done deliverable(s) old enough to archive (never shown in orientation -- pure disk weight).\nRun the `/claude-state-drift:clean` command (it dry-runs, confirms, then archives to an append-only .claude/state-archive.jsonl -- lossless; git is the backstop), or `state-clean --apply` directly. Tune via STATE_CLEAN_NUDGE_MIN (default 25); disable via STATE_CLEAN_NUDGE_DISABLE=1.\n</state-bloat>' "$ARCHIVABLE")
     fi
 fi
 
@@ -142,7 +142,7 @@ fi
 # lag_hours/commits_ahead (a --stats view surfaces "your state was N hours / M
 # commits behind your work"). A bloat-only emit records the archivable count
 # instead; it still counts as a state-staleness.sh fire in --stats activity
-# (acceptable conflation — bloat nudges are rare and stop once you run state-archive).
+# (acceptable conflation — bloat nudges are rare and stop once you run state-clean).
 SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
 if [ -n "$STALE_BLOCK" ]; then
     TELEM_EXTRA=$(printf '"lag_hours":%s,"commits_ahead":%s,"session":"%s"' "$STALE_LAG" "$STALE_COMMITS" "$SAFE_SID")

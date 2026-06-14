@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.14-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.15-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -67,7 +67,7 @@ flowchart LR
 - A `SessionStart` hook prints the orientation block.
 - A `UserPromptSubmit` hook (`focus-check`) re-injects the objective on a cadence you
   can tune per project (`.claude/hooks-config.json`).
-- A `Stop` hook flags stale state (and nudges you to run `state-archive` once enough old
+- A `Stop` hook flags stale state (and nudges you to run `state-clean` once enough old
   `done` deliverables pile up — it only flags, never auto-edits); a `PostToolUse` hook
   notices commits whose subject suggests a deliverable transition and points you at
   the `update-state` command.
@@ -89,7 +89,7 @@ a hook. Plugin commands are always namespaced in the Claude Code CLI — type
 | `/claude-state-drift:update-state` | Draft an update to `state.json` from recent work and show the diff. Never auto-writes — you approve every change. |
 | `/claude-state-drift:re-anchor` | Audit the current session against the objective and report alignment: on-track, mild drift, or significant drift. |
 | `/claude-state-drift:stats` | Show this project's own telemetry — sessions, per-injection token cost, activity, and nudge→update conversion — computed locally (needs `CLAUDE_HOOK_LOG=1`). |
-| `/claude-state-drift:archive` | Keep `state.json` lean: dry-runs `state-archive`, shows which old `done` deliverables would be archived, confirms with you, then archives them (to an append-only `state-archive.jsonl`; reversible). |
+| `/claude-state-drift:clean` | Keep `state.json` lean: dry-runs `state-clean`, shows which old `done` deliverables would be archived, confirms with you, then archives them (to an append-only `state-archive.jsonl`; reversible). |
 
 Outside the CLI (e.g. the desktop app), typed plugin commands aren't supported —
 just ask in plain words ("where am I?", "update the project state", "are we still
@@ -180,7 +180,7 @@ session while the plugin is enabled — just ask Claude to run them:
   cost, activity, and nudge→update conversion — computed locally from the opt-in
   hook log, when `CLAUDE_HOOK_LOG=1`).
 - `state-history` — append an entry to the per-project transition log.
-- `state-archive` — keep `state.json` lean: archive old `done` deliverables into an
+- `state-clean` — keep `state.json` lean: archive old `done` deliverables into an
   append-only `.claude/state-archive.jsonl` (dry-run by default; `--apply` to write;
   `--keep N`/`--older-than DAYS` tune it). Lossless — git and the archive are the
   backstop.
