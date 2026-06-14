@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""state-gc — keep .claude/state.json lean by archiving stale `done` deliverables
+"""state-archive — keep .claude/state.json lean by archiving stale `done` deliverables
 out to an append-only .claude/state-archive.jsonl.
 
 state.json is meant to hold CURRENT state; the work record grows without bound as
@@ -12,7 +12,7 @@ open_questions, and the current_focus head are NEVER touched.
 DEFAULT IS DRY-RUN. Nothing is written without --apply.
 
 Usage:
-    state-gc [<root>] [--apply] [--keep N] [--older-than DAYS] [--strip-prior] [--json]
+    state-archive [<root>] [--apply] [--keep N] [--older-than DAYS] [--strip-prior] [--json]
 
     --apply          write changes (default: dry-run — print what WOULD move)
     --keep N         always keep the N most-recent done deliverables in state.json
@@ -61,15 +61,15 @@ def project_root(arg):
 def _take_int(argv, i, flag, lo):
     """Parse `--flag <int>` with a lower bound, or return (None, None) on error."""
     if i + 1 >= len(argv):
-        print(f"state-gc: {flag} requires a value", file=sys.stderr)
+        print(f"state-archive: {flag} requires a value", file=sys.stderr)
         return None, None
     try:
         v = int(argv[i + 1])
     except ValueError:
-        print(f"state-gc: {flag} must be an integer", file=sys.stderr)
+        print(f"state-archive: {flag} must be an integer", file=sys.stderr)
         return None, None
     if v < lo:
-        print(f"state-gc: {flag} must be >= {lo}", file=sys.stderr)
+        print(f"state-archive: {flag} must be >= {lo}", file=sys.stderr)
         return None, None
     return v, i + 2
 
@@ -100,11 +100,11 @@ def parse_args(argv):
                 return None
         elif a == "--root":
             if i + 1 >= len(argv):
-                print("state-gc: --root requires a value", file=sys.stderr)
+                print("state-archive: --root requires a value", file=sys.stderr)
                 return None
             opts["root"] = argv[i + 1]; i += 2
         elif a.startswith("--"):
-            print(f"state-gc: unknown flag: {a}", file=sys.stderr)
+            print(f"state-archive: unknown flag: {a}", file=sys.stderr)
             return None
         else:
             opts["_positional"] = a; i += 1
@@ -146,15 +146,15 @@ def main(argv):
     root = project_root(opts.get("root") or opts.get("_positional"))
     state_path = root / ".claude" / "state.json"
     if not state_path.is_file():
-        print(f"state-gc: no state.json at {state_path}", file=sys.stderr)
+        print(f"state-archive: no state.json at {state_path}", file=sys.stderr)
         return 1
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        print(f"state-gc: cannot read state.json: {e}", file=sys.stderr)
+        print(f"state-archive: cannot read state.json: {e}", file=sys.stderr)
         return 1
     if not isinstance(state, dict):
-        print("state-gc: state.json is not a JSON object", file=sys.stderr)
+        print("state-archive: state.json is not a JSON object", file=sys.stderr)
         return 1
 
     now = datetime.now(timezone.utc)
@@ -192,12 +192,12 @@ def main(argv):
             state["deliverables"] = [d for d in deliverables if id(d) not in arch_ids]
             if strip:
                 state["current_focus"] = new_cf
-            tmp = state_path.with_suffix(".json.gc-tmp")
+            tmp = state_path.with_suffix(".json.archive-tmp")
             tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n",
                            encoding="utf-8")
             os.replace(tmp, state_path)  # atomic swap
         except OSError as e:
-            print(f"state-gc: write failed: {e}", file=sys.stderr)
+            print(f"state-archive: write failed: {e}", file=sys.stderr)
             return 1
         summary["applied"] = True
 
@@ -206,7 +206,7 @@ def main(argv):
         return 0
 
     mode = "APPLIED" if summary["applied"] else ("DRY-RUN" if (archivable or strip) else "nothing to do")
-    print(f"state-gc [{mode}] — {root.name or root}")
+    print(f"state-archive [{mode}] — {root.name or root}")
     print(f"  done deliverables: {done_total} (keeping {summary['kept_done']}, "
           f"archiving {len(archivable)}; keep>={opts['keep']}, older-than>{opts['older_than']}d)")
     for d in archivable:
