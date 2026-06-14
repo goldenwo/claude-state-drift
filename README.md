@@ -1,7 +1,7 @@
 # claude-state-drift
 
 [![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.10-blue)](https://github.com/goldenwo/claude-state-drift/releases)
+[![version](https://img.shields.io/badge/version-v0.1.11-blue)](https://github.com/goldenwo/claude-state-drift/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -177,6 +177,10 @@ session while the plugin is enabled — just ask Claude to run them:
   cost, activity, and nudge→update conversion — computed locally from the opt-in
   hook log, when `CLAUDE_HOOK_LOG=1`).
 - `state-history` — append an entry to the per-project transition log.
+- `state-gc` — keep `state.json` lean: archive old `done` deliverables into an
+  append-only `.claude/state-archive.jsonl` (dry-run by default; `--apply` to write;
+  `--keep N`/`--older-than DAYS` tune it). Lossless — git and the archive are the
+  backstop.
 - `workflows` — a cross-repo board: one row per project with a `state.json`
   (walks `~/dev` by default; override with `$WORKFLOWS_ROOT`).
 

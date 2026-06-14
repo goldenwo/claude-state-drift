@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""state-gc — keep .claude/state.json lean by archiving stale `done` deliverables
+out to an append-only .claude/state-archive.jsonl.
+
+state.json is meant to hold CURRENT state; the work record grows without bound as
+`done` deliverables accumulate (they are never rendered by where-am-i, so they are
+pure disk weight). This tool moves old `done` entries into a companion archive,
+losslessly: the archive is append-only, and git/CHANGELOG/state-history are the
+backstop. Only `done` deliverables are eligible — in-progress / deferred / blocked,
+open_questions, and the current_focus head are NEVER touched.
+
+DEFAULT IS DRY-RUN. Nothing is written without --apply.
+
+Usage:
+    state-gc [<root>] [--apply] [--keep N] [--older-than DAYS] [--strip-prior] [--json]
+
+    --apply          write changes (default: dry-run — print what WOULD move)
+    --keep N         always keep the N most-recent done deliverables in state.json
+                     regardless of age (default 10)
+    --older-than D   only archive done deliverables completed more than D days ago
+                     (default 30); entries with a missing/unparseable completed_at
+                     are NEVER archived (can't be safely dated)
+    --strip-prior    also drop '===PRIOR===' tail segments from current_focus
+                     (keeps only the head before the first marker)
+    --root <path>    project root (default: $CLAUDE_PROJECT_DIR, else cwd)
+    --json           machine-readable summary
+
+Exit codes:
+    0  ok (dry-run or applied)
+    2  usage error (message on stderr, no traceback)
+    1  unexpected I/O failure (message on stderr, no traceback)
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from _state_lib import parse_iso  # noqa: E402
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+PRIOR_MARKER = "===PRIOR==="
+ARCHIVE_FILENAME = "state-archive.jsonl"
+
+
+def project_root(arg):
+    """Resolve the project root — mirrors bin/where-am-i / bin/state-history."""
+    if arg:
+        return Path(arg).resolve()
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env:
+        return Path(env).resolve()
+    return Path.cwd()
+
+
+def _take_int(argv, i, flag, lo):
+    """Parse `--flag <int>` with a lower bound, or return (None, None) on error."""
+    if i + 1 >= len(argv):
+        print(f"state-gc: {flag} requires a value", file=sys.stderr)
+        return None, None
+    try:
+        v = int(argv[i + 1])
+    except ValueError:
+        print(f"state-gc: {flag} must be an integer", file=sys.stderr)
+        return None, None
+    if v < lo:
+        print(f"state-gc: {flag} must be >= {lo}", file=sys.stderr)
+        return None, None
+    return v, i + 2
+
+
+def parse_args(argv):
+    """Return an opts dict, or None on a usage error (after a stderr message)."""
+    opts = {"root": None, "apply": False, "keep": 10, "older_than": 30,
+            "strip_prior": False, "json": False, "_positional": None}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--help", "-h"):
+            print(__doc__)
+            return {"_help": True}
+        elif a == "--apply":
+            opts["apply"] = True; i += 1
+        elif a == "--strip-prior":
+            opts["strip_prior"] = True; i += 1
+        elif a == "--json":
+            opts["json"] = True; i += 1
+        elif a == "--keep":
+            opts["keep"], i = _take_int(argv, i, "--keep", 0)
+            if opts["keep"] is None:
+                return None
+        elif a == "--older-than":
+            opts["older_than"], i = _take_int(argv, i, "--older-than", 0)
+            if opts["older_than"] is None:
+                return None
+        elif a == "--root":
+            if i + 1 >= len(argv):
+                print("state-gc: --root requires a value", file=sys.stderr)
+                return None
+            opts["root"] = argv[i + 1]; i += 2
+        elif a.startswith("--"):
+            print(f"state-gc: unknown flag: {a}", file=sys.stderr)
+            return None
+        else:
+            opts["_positional"] = a; i += 1
+    return opts
+
+
+def select_archivable(deliverables, keep, older_than, now):
+    """Return (archivable, kept_reason) — the list of `done` deliverables eligible
+    to archive, given keep-recent-N and the age cutoff. A `done` entry is archivable
+    iff it has a parseable completed_at older than the cutoff AND is not among the
+    `keep` most-recent done entries. Non-done entries are never selected."""
+    done = [d for d in deliverables if d.get("status") == "done"]
+    # rank done entries by completed_at (newest first); undateable sort last.
+    def _key(d):
+        dt = parse_iso(d.get("completed_at"))
+        return dt or datetime.min.replace(tzinfo=timezone.utc)
+    done_sorted = sorted(done, key=_key, reverse=True)
+    protected = set(id(d) for d in done_sorted[:keep])  # keep N most-recent
+    cutoff_secs = older_than * 86400
+    archivable = []
+    for d in done:
+        if id(d) in protected:
+            continue
+        dt = parse_iso(d.get("completed_at"))
+        if dt is None:
+            continue  # undateable → never archive (can't be safely aged)
+        if (now - dt).total_seconds() > cutoff_secs:
+            archivable.append(d)
+    return archivable
+
+
+def main(argv):
+    opts = parse_args(argv)
+    if opts is None:
+        return 2
+    if opts.get("_help"):
+        return 0
+
+    root = project_root(opts.get("root") or opts.get("_positional"))
+    state_path = root / ".claude" / "state.json"
+    if not state_path.is_file():
+        print(f"state-gc: no state.json at {state_path}", file=sys.stderr)
+        return 1
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"state-gc: cannot read state.json: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(state, dict):
+        print("state-gc: state.json is not a JSON object", file=sys.stderr)
+        return 1
+
+    now = datetime.now(timezone.utc)
+    deliverables = state.get("deliverables", []) or []
+    archivable = select_archivable(deliverables, opts["keep"], opts["older_than"], now)
+
+    cf = state.get("current_focus", "") or ""
+    strip = opts["strip_prior"] and PRIOR_MARKER in cf
+    new_cf = cf.split(PRIOR_MARKER)[0].rstrip() if strip else cf
+
+    done_total = sum(1 for d in deliverables if d.get("status") == "done")
+    summary = {
+        "deliverables_total": len(deliverables),
+        "done_total": done_total,
+        "archivable": len(archivable),
+        "kept_done": done_total - len(archivable),
+        "strip_prior": strip,
+        "current_focus_chars_before": len(cf),
+        "current_focus_chars_after": len(new_cf),
+        "applied": False,
+        "archive_ids": [d.get("id") for d in archivable],
+    }
+
+    if opts["apply"] and (archivable or strip):
+        arch_path = root / ".claude" / ARCHIVE_FILENAME
+        arch_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            with arch_path.open("a", encoding="utf-8") as fh:
+                for d in archivable:
+                    rec = dict(d)
+                    rec["archived_at"] = stamp
+                    fh.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+            arch_ids = set(id(d) for d in archivable)
+            state["deliverables"] = [d for d in deliverables if id(d) not in arch_ids]
+            if strip:
+                state["current_focus"] = new_cf
+            tmp = state_path.with_suffix(".json.gc-tmp")
+            tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+            os.replace(tmp, state_path)  # atomic swap
+        except OSError as e:
+            print(f"state-gc: write failed: {e}", file=sys.stderr)
+            return 1
+        summary["applied"] = True
+
+    if opts["json"]:
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    mode = "APPLIED" if summary["applied"] else ("DRY-RUN" if (archivable or strip) else "nothing to do")
+    print(f"state-gc [{mode}] — {root.name or root}")
+    print(f"  done deliverables: {done_total} (keeping {summary['kept_done']}, "
+          f"archiving {len(archivable)}; keep>={opts['keep']}, older-than>{opts['older_than']}d)")
+    for d in archivable:
+        print(f"    archive: {d.get('id')}  (completed {d.get('completed_at')})")
+    if strip:
+        print(f"  current_focus: strip ===PRIOR=== {len(cf)} -> {len(new_cf)} chars")
+    if not summary["applied"] and (archivable or strip):
+        print("  (dry-run — re-run with --apply to write; archived entries go to "
+              ".claude/state-archive.jsonl, reversible)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
