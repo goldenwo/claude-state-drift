@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.17-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.18-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/made%20for-Claude%20Code-8A63D2" alt="made for Claude Code">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
@@ -151,8 +151,9 @@ short.)
 
 This plugin's own release pipeline was built while running the plugin — every
 session opened by its orientation block, drift-checked by its own `focus-check`.
-The receipts, as of June 2026: **50 deliverables tracked (49 shipped) and 69
-commits across the six-phase milestone** that produced this repo, June 6–11 2026:
+The repo was built across a **six-phase, 69-commit milestone** (June 6–11 2026)
+with every session tracked in `state.json` by the tool — and has been dogfooded
+through every release since (**70+ deliverables** tracked and counting):
 
 ```mermaid
 timeline
