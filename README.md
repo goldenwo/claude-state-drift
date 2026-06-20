@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.18-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.19-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/made%20for-Claude%20Code-8A63D2" alt="made for Claude Code">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
@@ -131,12 +131,13 @@ focus re-injection, is smaller than a single file read.
 
 Two things keep it bounded:
 
-- The focus re-injection is length-capped, so it can't grow without limit.
+- The re-injection stays small — `current_focus` is length-capped, and the objective is your one-line master vision.
 - The orientation block scales with what *you* put in `state.json` — a
   one-sentence `current_focus` keeps it near the low end. You're in control.
 
-Tune the cadence or disable any of it per project in `.claude/hooks-config.json`
-(see [SCHEMA.md](SCHEMA.md)). Nothing is measured remotely: the optional
+Tune or disable the per-prompt focus check per project in `.claude/hooks-config.json`
+(see [SCHEMA.md](SCHEMA.md)); the session-end staleness nudge has its own
+`STATE_STALENESS_*` environment switches. Nothing is measured remotely: the optional
 `CLAUDE_HOOK_LOG=1` writes a local `.claude/.hook-log.jsonl` and nothing leaves
 your machine. For scale, that per-session cost is in the same range as a lean
 project `CLAUDE.md`, and a small fraction of what one MCP server's tool
