@@ -1,21 +1,22 @@
-# claude-state-drift
+<p align="center">
+  <img src="assets/banner.svg" alt="claude-state-drift — your project's state, surfaced at every session start" width="840">
+</p>
 
-[![ci](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml)
-[![version](https://img.shields.io/badge/version-v0.1.15-blue)](https://github.com/goldenwo/claude-state-drift/releases)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.16-blue" alt="version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+  <img src="https://img.shields.io/badge/made%20for-Claude%20Code-8A63D2" alt="made for Claude Code">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
+</p>
 
-State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).
-Every session opens with your project's actual state — not a cold start:
+**State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).** Every session opens with your project's *actual* state — objective, current focus, what's in flight — instead of a cold start. No more "wait, what were we building again?"
 
-```
-=== WHERE YOU ARE ===
-Project: my-api
-Version: 1.4.0 | Objective: Ship the v2 billing pipeline with usage-based invoicing
-Focus:   Webhook retry queue done; now wiring the invoice-preview endpoint
-In progress: invoice-preview-endpoint
-Deferred:    csv-export (until billing v2 ships)
-Recent: 3 commits today, last: "Add retry backoff to webhook queue"
-```
+## ✨ See it in action
+
+<p align="center">
+  <img src="assets/demo.gif" alt="claude-state-drift: where-am-i prints the orientation block at session start, then where-am-i --stats shows the per-session cost" width="840">
+</p>
 
 Long agent sessions measurably lose the plot: models retrieve worst from the middle of
 long inputs ([Liu et al., TACL 2024](https://arxiv.org/abs/2307.03172)), grow
@@ -112,6 +113,10 @@ lives in a scrolling context window:
 A tool that fights context rot only earns its keep if it isn't itself context
 bloat. It isn't — and almost all of the cost is paid once, at session start:
 
+<p align="center">
+  <img src="assets/stats.png" alt="where-am-i --stats: per-session cost and activity, computed locally from the opt-in hook log" width="760">
+</p>
+
 | Injection | When | Typical size |
 |---|---|---|
 | Orientation block | once, at session start | ~700–2,000 tokens |
@@ -186,6 +191,10 @@ session while the plugin is enabled — just ask Claude to run them:
   backstop.
 - `workflows` — a cross-repo board: one row per project with a `state.json`
   (walks `~/dev` by default; override with `$WORKFLOWS_ROOT`).
+
+<p align="center">
+  <img src="assets/board.png" alt="the workflows board: one row per project, with a freshness column flagging stale state" width="840">
+</p>
 
 ## Requirements
 
