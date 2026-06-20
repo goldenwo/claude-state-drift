@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.16-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.17-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/made%20for-Claude%20Code-8A63D2" alt="made for Claude Code">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
@@ -27,7 +27,7 @@ continuously re-surfaces it so the goal never depends on what's still in context
 
 ## Highlights
 
-- **Orientation on every session start** — the "WHERE YOU ARE" block above, generated
+- **Orientation on every session start** — the "WHERE YOU ARE" block shown above, generated
   from your project's real state.
 - **Drift checks while you work** — the objective and current focus are re-injected
   every few prompts, so the goal never fully leaves context.
@@ -116,6 +116,8 @@ bloat. It isn't — and almost all of the cost is paid once, at session start:
 <p align="center">
   <img src="assets/stats.png" alt="where-am-i --stats: per-session cost and activity, computed locally from the opt-in hook log" width="760">
 </p>
+
+<p align="center"><sub><em>From a small demo project — the orientation block scales with your <code>state.json</code> size; the typical range is below.</em></sub></p>
 
 | Injection | When | Typical size |
 |---|---|---|
