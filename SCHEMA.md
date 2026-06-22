@@ -3,8 +3,7 @@
 `claude-state-drift` keeps a small JSON file, `.claude/state.json`, at the root of
 each project. It records the project's master objective, the current focus, and a
 list of deliverables with their status. The hooks, commands, and skills in this
-plugin read and surface that file to keep long Claude Code sessions anchored to
-their goal.
+plugin read and surface that file at session start and as you work.
 
 This document is the canonical schema. Validate any `state.json` with the bundled
 `state-validate` tool — it exits `0` when the file is valid. The tool is on the

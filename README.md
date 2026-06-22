@@ -4,13 +4,13 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.20-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.21-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/made%20for-Claude%20Code-8A63D2" alt="made for Claude Code">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
 </p>
 
-**State-tracking and drift-mitigation for [Claude Code](https://docs.claude.com/en/docs/claude-code).** Every session opens with your project's *actual* state — objective, current focus, what's in flight — instead of a cold start. No more "wait, what were we building again?"
+**State-tracking for [Claude Code](https://docs.claude.com/en/docs/claude-code).** Every session opens with your project's *actual* state — objective, current focus, what's in flight — instead of a cold start or re-explaining where you left off.
 
 ## ✨ See it in action
 
@@ -23,14 +23,14 @@ long inputs ([Liu et al., TACL 2024](https://arxiv.org/abs/2307.03172)), grow
 unreliable as inputs lengthen ([Chroma, 2025](https://www.trychroma.com/research/context-rot)),
 and drift from their goal as context grows ([Arike et al., 2025](https://arxiv.org/abs/2505.02709)).
 `claude-state-drift` keeps a small, human-readable `.claude/state.json` per project and
-continuously re-surfaces it so the goal never depends on what's still in context.
+re-surfaces it on a cadence, independent of the live context window.
 
 ## Highlights
 
 - **Orientation on every session start** — the "WHERE YOU ARE" block shown above, generated
   from your project's real state.
 - **Drift checks while you work** — the objective and current focus are re-injected
-  every few prompts, so the goal never fully leaves context.
+  every few prompts (cadence tunable per project).
 - **Staleness nudges** — get flagged when `state.json` looks out of date relative to
   recent work, or when a commit looks like it finished a deliverable.
 - **Zero workflow change** — all of the above is automatic, driven by hooks. You
@@ -110,7 +110,7 @@ lives in a scrolling context window:
 
 ## What it costs
 
-A tool that fights context rot only earns its keep if it isn't itself context
+A tool meant to offset context rot only earns its keep if it isn't itself context
 bloat. It isn't — and almost all of the cost is paid once, at session start:
 
 <p align="center">
