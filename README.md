@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.21-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.22-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/made%20for-Claude%20Code-8A63D2" alt="made for Claude Code">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
@@ -47,6 +47,13 @@ re-surfaces it on a cadence, independent of the live context window.
 Then drop a starter `.claude/state.json` into your project — copy one from
 [SCHEMA.md](SCHEMA.md) — and start a session. Uninstall any time with
 `/plugin uninstall claude-state-drift`.
+
+### Use it in GitHub Copilot CLI
+
+The `copilot/` directory ships thin adapter hooks that read the same
+`.claude/state.json` and emit it as Copilot's `additionalContext` — one hook at
+session start, one after commits. See [copilot/README-copilot.md](copilot/README-copilot.md)
+for install instructions and a full description of what each hook does.
 
 ## How it works
 
