@@ -1,0 +1,12 @@
+{
+  "name": "claude-state-drift",
+  "plugins": [
+    {
+      "name": "claude-state-drift",
+      "source": {
+        "source": "local",
+        "path": "."
+      }
+    }
+  ]
+}

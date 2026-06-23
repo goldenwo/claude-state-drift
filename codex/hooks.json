@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ {
+        "type": "command",
+        "command": "bash ${PLUGIN_ROOT}/hooks/session-start-orient.sh",
+        "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/codex/run-hook.ps1\" session-start-orient.sh",
+        "timeout": 15,
+        "statusMessage": "claude-state-drift: orientation"
+      } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [ {
+        "type": "command",
+        "command": "bash ${PLUGIN_ROOT}/hooks/state-track-commit.sh",
+        "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/codex/run-hook.ps1\" state-track-commit.sh",
+        "timeout": 15,
+        "statusMessage": "claude-state-drift: commit-transition"
+      } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ {
+        "type": "command",
+        "command": "bash ${PLUGIN_ROOT}/hooks/focus-check.sh",
+        "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/codex/run-hook.ps1\" focus-check.sh",
+        "timeout": 10,
+        "statusMessage": "claude-state-drift: focus-check"
+      } ] }
+    ],
+    "Stop": [
+      { "hooks": [ {
+        "type": "command",
+        "command": "bash ${PLUGIN_ROOT}/hooks/state-staleness.sh",
+        "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/codex/run-hook.ps1\" state-staleness.sh",
+        "timeout": 15,
+        "statusMessage": "claude-state-drift: staleness"
+      } ] }
+    ]
+  }
+}

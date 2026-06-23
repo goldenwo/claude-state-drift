@@ -13,5 +13,7 @@
     "drift-mitigation",
     "orientation",
     "session-state"
-  ]
+  ],
+  "hooks": "./codex/hooks.json",
+  "skills": "./skills/"
 }

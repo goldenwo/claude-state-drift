@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.1.25-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.2.0-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/runs%20in-Claude%20Code%20%C2%B7%20Copilot%20CLI%20%C2%B7%20Codex%20CLI-8A63D2" alt="runs in Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">

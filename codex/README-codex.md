@@ -6,26 +6,27 @@ lifecycle hooks, so project state surfaces the same way across both tools.
 
 ## Install
 
-Clone the repo (the install scripts ship in it), then run the installer from its root:
+claude-state-drift installs as a Codex plugin from its marketplace:
 
 ```bash
-git clone https://github.com/goldenwo/claude-state-drift.git
-cd claude-state-drift
-bash codex/install.sh
+codex plugin marketplace add goldenwo/claude-state-drift
+codex plugin add claude-state-drift@claude-state-drift
 ```
 
-On Windows you can also run `pwsh codex/install.ps1` (it locates git-bash and
-delegates — the hooks themselves run via bash). Both are idempotent. To remove:
+`marketplace add` registers this repo as a Codex plugin marketplace; `plugin add`
+installs and enables the plugin — its four lifecycle hooks plus the `update-state` and
+`re-anchor` skills — caching it under `~/.codex/plugins/cache/`. On first run Codex
+asks you to trust the plugin's hooks; approve them. To remove:
 
 ```bash
-bash codex/install.sh --uninstall      # or: pwsh codex/install.ps1 -Uninstall
+codex plugin remove claude-state-drift@claude-state-drift
 ```
 
-The installer copies the hooks, the `where-am-i` helper, and a launcher into
-`~/.codex/state-drift/`, copies the `update-state` and `re-anchor` skills into
-`~/.agents/skills/`, and merges four hook entries into `~/.codex/hooks.json`
-(existing hooks are preserved). On first run, Codex asks you to trust the hooks —
-approve them via `/hooks`.
+**Windows:** the hooks are bash scripts, so the plugin runs them through **git-bash**,
+which it locates automatically from your `git` installation — make sure
+[Git for Windows](https://gitforwindows.org/) is installed. (Codex spawns bare `bash`,
+which on Windows can resolve to the WSL launcher rather than git-bash; the plugin's
+`commandWindows` launcher resolves git-bash explicitly so the hooks run.)
 
 ## What the Codex CLI port does (mechanism)
 
@@ -41,7 +42,7 @@ port registers four:
 | Drift re-inject | `UserPromptSubmit` | `focus-check.sh` re-emits the objective + current focus every Nth prompt (default 6). |
 | Staleness / bloat | `Stop` | `state-staleness.sh` flags a stale or bloated `state.json` at session end. |
 
-Two skills are installed into `~/.agents/skills/` and discoverable by Codex:
+Two skills ship with the plugin and are discoverable by Codex:
 
 | Skill | What it does |
 |---|---|
