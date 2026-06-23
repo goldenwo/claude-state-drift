@@ -58,11 +58,15 @@ esac
 # spaces so the read-N-lines pattern stays correct). Cuts ~30ms off every
 # Bash PostToolUse fire that matches the substring filter above.
 #
-# NOTE: tool_response.exit_code field presence in PostToolUse(Bash) payload is
-# not fully documented. We treat a missing field as success (// 0) — if Claude
-# Code never emits it for Bash, this hook nudges on every successful-looking
-# commit. The subsequent git-log check ensures we only nudge for real commits
-# that actually landed (failed commits don't change HEAD).
+# NOTE: tool_response shape varies by assistant. Claude Code sends an OBJECT
+# (.exit_code may be absent → // 0 = treat as success). OpenAI Codex CLI sends
+# tool_response as a STRING (the stdout); indexing a string with .exit_code is a
+# jq ERROR (exit 5) that would truncate this whole extraction and silently drop
+# the nudge. The `?` (.exit_code?) makes the index optional — empty on a string,
+# the value on an object — so it defaults to 0 on Codex and is byte-unchanged on
+# Claude. The subsequent git-log + HEAD-freshness checks ensure we only nudge for
+# real commits that actually landed (failed commits don't change HEAD), so
+# defaulting a missing/absent exit_code to success is safe on both.
 {
     IFS= read -r TOOL_NAME
     IFS= read -r CMD
@@ -72,7 +76,7 @@ esac
 } < <(printf '%s' "$INPUT" | jq -r '
     .tool_name // "",
     (.tool_input.command // "" | tostring | gsub("\n"; " ")),
-    (.tool_response.exit_code // 0 | tostring),
+    (.tool_response.exit_code? // 0 | tostring),
     .cwd // "",
     .session_id // .sessionId // ""
 ' 2>/dev/null | tr -d '\r')
