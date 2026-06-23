@@ -6,9 +6,11 @@ lifecycle hooks, so project state surfaces the same way across both tools.
 
 ## Install
 
-From the root of the `claude-state-drift` distribution:
+Clone the repo (the install scripts ship in it), then run the installer from its root:
 
 ```bash
+git clone https://github.com/goldenwo/claude-state-drift.git
+cd claude-state-drift
 bash codex/install.sh
 ```
 

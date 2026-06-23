@@ -7,7 +7,12 @@ surfaces in the same way across both tools.
 
 ## Install
 
-From the root of the `claude-state-drift` distribution:
+Clone the repo (the install scripts ship in it), then run the installer from its root:
+
+```bash
+git clone https://github.com/goldenwo/claude-state-drift.git
+cd claude-state-drift
+```
 
 **Bash (Linux / macOS / Git Bash on Windows):**
 ```bash
@@ -24,7 +29,7 @@ Both installers are idempotent — running them a second time is safe. To remove
 ```bash
 bash copilot/install.sh --uninstall
 # or
-pwsh copilot/install.ps1 --uninstall
+pwsh copilot/install.ps1 -Uninstall
 ```
 
 The installer copies adapter scripts and the `where-am-i` helper into
