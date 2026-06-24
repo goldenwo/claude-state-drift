@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "bash \"$CLAUDE_PLUGIN_ROOT/copilot/hooks/orient-hook.sh\"",
+        "powershell": "& \"$env:CLAUDE_PLUGIN_ROOT/copilot/hooks/orient-hook.ps1\"",
+        "cwd": ".",
+        "timeoutSec": 15
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": "bash \"$CLAUDE_PLUGIN_ROOT/copilot/hooks/transition-hook.sh\"",
+        "powershell": "& \"$env:CLAUDE_PLUGIN_ROOT/copilot/hooks/transition-hook.ps1\"",
+        "cwd": ".",
+        "timeoutSec": 15
+      }
+    ]
+  }
+}

@@ -7,36 +7,27 @@ surfaces in the same way across both tools.
 
 ## Install
 
-Clone the repo (the install scripts ship in it), then run the installer from its root:
+claude-state-drift installs as a Copilot plugin from its marketplace:
 
 ```bash
-git clone https://github.com/goldenwo/claude-state-drift.git
-cd claude-state-drift
+copilot plugin marketplace add goldenwo/claude-state-drift
+copilot plugin install claude-state-drift@claude-state-drift
 ```
 
-**Bash (Linux / macOS / Git Bash on Windows):**
-```bash
-bash copilot/install.sh
-```
-
-**PowerShell (Windows):**
-```powershell
-pwsh copilot/install.ps1
-```
-
-Both installers are idempotent — running them a second time is safe. To remove:
+`marketplace add` registers this repo as a Copilot plugin marketplace; `plugin
+install` installs the plugin — its `sessionStart` and `postToolUse` hooks plus the
+`update-state` and `re-anchor` skills — caching it under
+`~/.copilot/installed-plugins/`. To remove:
 
 ```bash
-bash copilot/install.sh --uninstall
-# or
-pwsh copilot/install.ps1 -Uninstall
+copilot plugin uninstall claude-state-drift
+copilot plugin marketplace remove claude-state-drift
 ```
 
-The installer copies adapter scripts and the `where-am-i` helper into
-`~/.copilot/state-drift/`, copies the `update-state` and `re-anchor` skills into
-`~/.copilot/skills/`, and writes a hook registration file to
-`~/.copilot/hooks/claude-state-drift.json`. Everything resolves by absolute path —
-no PATH changes are required.
+**Windows:** Copilot runs the PowerShell hook variant natively — no git-bash is
+needed. `where-am-i` is a Python script, so make sure Python is on your `PATH`
+(`py`, `python3`, or `python`); without it the orientation hook stays silent. On
+Linux/macOS the hooks run under bash and also use `jq`.
 
 ## What the Copilot CLI port does (mechanism)
 

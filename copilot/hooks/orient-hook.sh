@@ -13,8 +13,7 @@
 #   CLAUDE_PROJECT_DIR — passed through to where-am-i for project root resolution.
 set -euo pipefail
 
-# Resolve this script's own directory so we can locate where-am-i at its
-# installed sibling path without relying on any env var being set.
+# Resolve this script's own directory for the legacy sibling-bin fallback below.
 # Copilot calls hooks by absolute path, so ${BASH_SOURCE[0]} is always absolute.
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -30,16 +29,22 @@ for _cand in python3 python py; do
 done
 
 # WHEREAMI_STUB lets tests inject output without the real bin on PATH (highest priority).
-# When unset (production): self-locate where-am-i at $DIR/bin/where-am-i — the installer
-# places bin/ as a direct child of the same directory the adapters live in
-# (i.e. $COPILOT_HOME/state-drift/{orient-hook.sh,bin/where-am-i}). Pass $PWD (the
-# project Copilot opened) so where-am-i reads its .claude/state.json.
-# Fall back to bare 'where-am-i' on PATH for manually configured installs.
+# When unset (production): resolve where-am-i. In the marketplace-plugin layout the
+# adapters live at $CLAUDE_PLUGIN_ROOT/copilot/hooks/ while bin/ sits at the plugin
+# ROOT, so a sibling self-locate ($DIR/bin) does NOT resolve — prefer the plugin-root
+# env var (Copilot/Codex/Claude all export CLAUDE_PLUGIN_ROOT = the install dir). Fall
+# back to the sibling layout (legacy direct-copy installs), then bare 'where-am-i' on
+# PATH. Pass $PWD (the project Copilot opened) so where-am-i reads its .claude/state.json.
 if [ "${WHEREAMI_STUB+x}" ]; then
     block="$WHEREAMI_STUB"
 else
-    _wai="$DIR/bin/where-am-i"
-    [ -f "$_wai" ] || _wai="$(command -v where-am-i 2>/dev/null || true)"
+    if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$CLAUDE_PLUGIN_ROOT/bin/where-am-i" ]; then
+        _wai="$CLAUDE_PLUGIN_ROOT/bin/where-am-i"
+    elif [ -f "$DIR/bin/where-am-i" ]; then
+        _wai="$DIR/bin/where-am-i"
+    else
+        _wai="$(command -v where-am-i 2>/dev/null || true)"
+    fi
     if [ -n "$_wai" ] && [ -n "$_pybin" ]; then
         block="$("$_pybin" "$_wai" "$PWD" 2>/dev/null || true)"
     elif [ -n "$_wai" ]; then
