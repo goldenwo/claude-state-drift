@@ -39,7 +39,7 @@ port registers four:
 |---|---|---|
 | Orientation | `SessionStart` | `session-start-orient.sh` reads `.claude/state.json` and emits the "WHERE YOU ARE" block. Silent when no `state.json`. |
 | Commit-transition | `PostToolUse` (matcher `Bash`) | `state-track-commit.sh` — when a `git commit` subject contains a transition keyword (ship, release, complete, done, finish, deliver, or a version tag), emits a nudge pointing at the `update-state` skill. Silent otherwise. |
-| Drift re-inject | `UserPromptSubmit` | `focus-check.sh` re-emits the objective + current focus every Nth prompt (default 6). |
+| Focus re-inject | `UserPromptSubmit` | `focus-check.sh` re-emits the objective + current focus every Nth prompt (default 6). |
 | Staleness / bloat | `Stop` | `state-staleness.sh` flags a stale or bloated `state.json` at session end. |
 
 Two skills ship with the plugin and are discoverable by Codex:
