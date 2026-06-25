@@ -1,6 +1,6 @@
 {
   "name": "claude-state-drift",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A per-project state layer for long Claude Code sessions: keeps a .claude/state.json (objective / current focus / deliverables), prints a WHERE YOU ARE orientation block at session start, re-injects the goal as you work, and nudges when state goes stale — with /where-am-i, /update-state, and /re-anchor.",
   "author": {
     "name": "goldenwo"

@@ -4,13 +4,18 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.3.0-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.3.1-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/runs%20in-Claude%20Code%20%C2%B7%20Copilot%20CLI%20%C2%B7%20Codex%20CLI-8A63D2" alt="runs in Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
 </p>
 
-**State-tracking for [Claude Code](https://docs.claude.com/en/docs/claude-code), GitHub Copilot CLI, and OpenAI Codex CLI.** Every session opens with your project's *actual* state — objective, current focus, what's in flight — instead of a cold start or re-explaining where you left off. One `.claude/state.json` drives the same orientation in all three.
+**Pick up exactly where you left off — every session.**
+
+One `.claude/state.json` holds your project's objective, deliverables, and open
+questions — and [Claude Code](https://docs.claude.com/en/docs/claude-code), GitHub
+Copilot CLI, and OpenAI Codex CLI all open the session with it, auto-shown as a
+**WHERE YOU ARE** block before your first prompt.
 
 ## ✨ See it in action
 
@@ -18,21 +23,26 @@
   <img src="assets/demo.gif" alt="claude-state-drift: where-am-i prints the orientation block at session start, then where-am-i --stats shows the per-session cost" width="840">
 </p>
 
-Long agent sessions measurably lose the plot: models retrieve worst from the middle of
-long inputs ([Liu et al., TACL 2024](https://arxiv.org/abs/2307.03172)), grow
-unreliable as inputs lengthen ([Chroma, 2025](https://www.trychroma.com/research/context-rot)),
-and drift from their goal as context grows ([Arike et al., 2025](https://arxiv.org/abs/2505.02709)).
-`claude-state-drift` keeps a small, human-readable `.claude/state.json` per project and
-re-surfaces it on a cadence, independent of the live context window.
+## Why
+
+Coming back to a project — a week later or an hour later — means rebuilding context
+before you can do anything useful: *what was I doing, what's already done, what's still
+open?* `claude-state-drift` keeps that answer in one small `.claude/state.json` and puts
+it in front of you and the agent before the first prompt — no reconstructing it from
+scrollback, memory, or `git log`.
 
 ## Highlights
 
-- **Orientation on every session start** — the "WHERE YOU ARE" block shown above, generated
-  from your project's real state.
-- **Drift checks while you work** — the objective and current focus are re-injected
-  every few prompts (cadence tunable per project).
+- **Orientation on every session start** — the "WHERE YOU ARE" block shown above,
+  generated from your project's real state: objective, current focus, what's done, and
+  what's still open.
+- **Your objective, kept in view** — in interactive sessions the objective and current
+  focus are re-surfaced every few prompts, so they don't scroll out of reach (cadence
+  tunable per project).
 - **Staleness nudges** — get flagged when `state.json` looks out of date relative to
   recent work, or when a commit looks like it finished a deliverable.
+- **You stay in control** — `state.json` is never silently rewritten; updates are drafted
+  and shown as a diff before they land. A curated north-star, not an auto-captured log.
 - **Zero workflow change** — all of the above is automatic, driven by hooks. You
   never have to remember to invoke anything; the [commands](#commands) exist for
   when you *want* manual control.
@@ -93,18 +103,25 @@ flowchart LR
     U --> S
 ```
 
-- A `SessionStart` hook prints the orientation block.
-- A `UserPromptSubmit` hook (`focus-check`) re-injects the objective on a cadence you
-  can tune per project (`.claude/hooks-config.json`).
-- A `Stop` hook flags stale state (and nudges you to run `state-clean` once enough old
-  `done` deliverables pile up — it only flags, never auto-edits); a `PostToolUse` hook
-  notices commits whose subject suggests a deliverable transition and points you at
-  the `update-state` command.
-- Everything is computed from local files and local git.
-
-None of this needs you to do anything: install, drop in a `state.json`, and the
-hooks run on every session from then on. Claude also invokes the update and
-re-anchor skills on its own when it detects a finished deliverable or drift.
+1. **Auto-injected at session start — zero action.** A `SessionStart` hook prints the
+   "WHERE YOU ARE" block from `state.json`. Install it, drop in a `state.json`, and it
+   runs on every session from then on; you never invoke anything.
+2. **You stay in control.** `state.json` is *never* silently rewritten. When there's an
+   update to make — a finished deliverable, a shifted focus — it's drafted and shown to
+   you as a diff before it lands. It's a curated north-star you approve, not an
+   auto-captured log of everything you did — the honest edge over tools that scrape a
+   session into state behind your back.
+3. **Nudged to keep it fresh.** A `PostToolUse` hook spots commits whose subject looks
+   like a finished deliverable and points you at `update-state`; a `Stop` hook flags
+   `state.json` when it looks stale (and suggests `state-clean` once old `done`
+   deliverables pile up — it only ever flags, never auto-edits). In interactive sessions,
+   a `UserPromptSubmit` hook also re-surfaces the objective every few prompts (cadence
+   tunable in `.claude/hooks-config.json`).
+4. **Honest scope note.** That periodic re-surfacing rides on your prompts, so it's
+   *interactive-only*: a headless run with no user turns — `claude -p`, an
+   autonomously-driven SDK loop, CI — gets the one-time session-start orientation and
+   nothing recurring. Everything is computed from local files and local git; nothing
+   leaves your machine.
 
 ## Commands
 
@@ -179,7 +196,7 @@ short.)
 ## Built with itself
 
 This plugin's own release pipeline was built while running the plugin — every
-session opened by its orientation block, drift-checked by its own `focus-check`.
+session opened by its orientation block, its objective re-surfaced by its own `focus-check`.
 The repo was built across a **six-phase, 69-commit milestone** (June 6–11 2026)
 with every session tracked in `state.json` by the tool — and has been dogfooded
 through every release since (**70+ deliverables** tracked and counting):
@@ -193,8 +210,7 @@ timeline
     2026-06-11 : v0.1.0 published
 ```
 
-That's heavy real-world use, not a controlled study — a measured with/without
-comparison is planned, and this section will carry the results when they exist.
+That's heavy real-world use — a dogfooding record, not a controlled efficacy claim.
 
 ## The `state.json` model
 
@@ -204,6 +220,8 @@ The whole system revolves around one file, `.claude/state.json`:
 - `current_focus` — one sentence on what you're doing right now.
 - `deliverables[]` — units of work, each with a `status` (`done` / `in_progress` /
   `deferred` / `blocked`).
+- `open_questions[]` — unresolved decisions, so they resurface instead of getting lost.
+- `blocked[]` — work waiting on something external.
 
 See [SCHEMA.md](SCHEMA.md) for the full schema, a copy-paste starter file, and the
 per-project `.claude/hooks-config.json` knobs.
