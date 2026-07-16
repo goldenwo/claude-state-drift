@@ -30,8 +30,21 @@ def project_root(arg):
 
 
 def norm_path(p):
-    """Windows-shape-insensitive comparison form: c:\\dev\\Foo == C:/dev/Foo."""
-    return os.path.normcase(os.path.normpath(os.path.abspath(str(p)))).replace("\\", "/")
+    """Windows-shape-insensitive comparison form: c:\\dev\\Foo == C:/dev/Foo.
+
+    realpath (not just abspath) so 8.3 short names expand for EXISTING paths:
+    on the Windows CI runner the temp root is C:/Users/RUNNER~1/..., while
+    where-am-i hands us a Path.resolve()d (long-form) root — without the
+    expansion the two spellings of the same directory fail the project-match
+    guard and the handoff silently doesn't embed (public v0.4.0 CI red).
+    Non-existent paths pass through unchanged, so mismatch tests still work.
+    """
+    p = os.path.abspath(str(p))
+    try:
+        p = os.path.realpath(p)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.normpath(p)).replace("\\", "/")
 
 
 def now_iso():
@@ -300,6 +313,24 @@ def run_tests():
         out = read_for_orient(tmp)
         assert out and "line" in out, "path-shape variant wrongly treated as mismatch"
 
+    def t_read_short_path_variant_matches(tmp):
+        # Windows 8.3 short-name spelling of the SAME dir must match (the
+        # public-CI RUNNER~1 regression). Windows-only: needs a real short
+        # name; elsewhere this degenerates to a same-path sanity check.
+        compose(tmp)
+        variant = str(tmp)
+        if os.name == "nt":
+            import ctypes
+            buf = ctypes.create_unicode_buffer(512)
+            if ctypes.windll.kernel32.GetShortPathNameW(str(tmp), buf, 512):
+                variant = buf.value
+        latest = tmp / ".claude" / HANDOFF_DIR / LATEST
+        txt = re.sub(r"project_path: .*", lambda m: f"project_path: {variant}",
+                     latest.read_text(encoding="utf-8"))
+        latest.write_text(txt, encoding="utf-8")
+        out = read_for_orient(tmp)
+        assert out and "line" in out, "8.3 short-path spelling wrongly treated as mismatch"
+
     def t_read_superseded_by_newer_state(tmp):
         compose(tmp)
         sj = tmp / ".claude" / "state.json"
@@ -361,6 +392,7 @@ def run_tests():
     case("read: fresh handoff renders w/ boundary + preface", t_read_fresh_renders)
     case("read: project mismatch warns, never renders body", t_read_project_mismatch)
     case("read: Windows path-shape variants match", t_read_path_shape_variants_match)
+    case("read: 8.3 short-path spelling matches", t_read_short_path_variant_matches)
     case("read: superseded by newer state", t_read_superseded_by_newer_state)
     case("read: 5s tolerance window honored", t_read_tolerance_window)
     case("read: malformed frontmatter -> one warn line", t_read_malformed_frontmatter)
