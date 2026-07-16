@@ -38,9 +38,9 @@ Skip for trivial updates (typo fixes, single-line refactors). Trust the SessionS
    - Apply the deliverable/question changes from step 3.
    - Preserve order and formatting (2-space indent, trailing newline).
 
-5. **Show the user.** Print a one-paragraph plain-English summary of the proposed changes (what's transitioning to what, what's new, what's resolved). Then show the actual `Edit` block ready to apply. **Wait for approval.**
+5. **Show the user.** Print a one-paragraph plain-English summary of the proposed changes (what's transitioning to what, what's new, what's resolved). Then show the actual `Edit` block ready to apply. End with one line: **the strongest reason NOT to approve as-is** (the weakest inference in the draft — e.g. a `done` transition whose verification is thin, or an inferred title/version; every draft has a weakest inference, name it rather than inventing an objection). Forcing function: the user should evaluate an argument, not ratify one. **Wait for approval.**
 
-6. **On approval, apply.** Run the `Edit` tool. Then **run `state-validate` (on PATH while the plugin is enabled) to verify the write produced a schema-valid state.json**. If validate reports errors, fix them before continuing (the diff likely missed a required field or has a malformed timestamp). Confirm with `where-am-i` to show the new orientation block.
+6. **On approval, apply.** **Re-read `.claude/state.json` immediately before editing** — the approval wait is a window where a concurrent side session or hook may have changed the file, and a stale anchor (e.g. an outdated `last_updated` value) fails the Edit; re-anchor the draft on the fresh content if it moved. Then run the `Edit` tool. Then **run `state-validate` (on PATH while the plugin is enabled) to verify the write produced a schema-valid state.json**. If validate reports errors, fix them before continuing (the diff likely missed a required field or has a malformed timestamp). Confirm with `where-am-i` to show the new orientation block.
 
 7. **Status-transition tracking.** When changing a deliverable's `status` field, also set `status_changed_at` to the current ISO timestamp. This is the audit trail for "when did X transition" queries.
 

@@ -113,7 +113,7 @@ WRAPPED=$(printf '<state-tracking-orientation>\n%s\n</state-tracking-orientation
 # whitelist-safe charset so a malformed id can never corrupt the JSONL.
 CTX_BYTES=$(printf '%s' "$WRAPPED" | wc -c 2>/dev/null | tr -d '[:space:]')
 case "$CTX_BYTES" in ''|*[!0-9]*) CTX_BYTES=0 ;; esac
-SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+telem_safe_sid "$SESSION_ID"
 TELEM_EXTRA=$(printf '"ctx_bytes":%s,"session":"%s"' "$CTX_BYTES" "$SAFE_SID")
 TELEM_EMIT=1
 

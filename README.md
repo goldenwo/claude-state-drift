@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.3.2-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.4.0-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/runs%20in-Claude%20Code%20%C2%B7%20Copilot%20CLI%20%C2%B7%20Codex%20CLI-8A63D2" alt="runs in Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
@@ -41,6 +41,11 @@ scrollback, memory, or `git log`.
   tunable per project).
 - **Staleness nudges** — get flagged when `state.json` looks out of date relative to
   recent work, or when a commit looks like it finished a deliverable.
+- **Session handoffs** — end a session with `/claude-state-drift:handoff` and the next
+  session in that project opens with the handoff embedded in its orientation: the
+  narrative context (next move, gotchas, dangling threads) that `state.json`
+  deliberately excludes. When context use runs high, a one-line nudge suggests
+  composing one — at most once per session.
 - **You stay in control** — `state.json` is never silently rewritten; updates are drafted
   and shown as a diff before they land. A curated north-star, not an auto-captured log.
 - **Zero workflow change** — all of the above is automatic, driven by hooks. You
@@ -71,7 +76,9 @@ The plugin's `sessionStart` and `postToolUse` hooks read the same
 `.claude/state.json` and emit it as Copilot's `additionalContext` — one hook at
 session start, one after commits. See
 [copilot/README-copilot.md](copilot/README-copilot.md) for full instructions and
-what each hook does.
+what each hook does. One scope note: the context-pressure handoff *nudge* is not
+supported on Copilot (its `userPromptSubmitted` event doesn't inject context) — a
+parked handoff still loads at session start there via the orientation hook.
 
 ### OpenAI Codex CLI
 
@@ -88,7 +95,7 @@ focus re-inject, and staleness. See
 
 ## How it works
 
-Four hooks — all automatic — and five optional commands, all reading one file:
+Four hooks — all automatic — and six optional commands, all reading one file:
 
 ```mermaid
 flowchart LR
@@ -117,7 +124,18 @@ flowchart LR
    deliverables pile up — it only ever flags, never auto-edits). In interactive sessions,
    a `UserPromptSubmit` hook also re-surfaces the objective every few prompts (cadence
    tunable in `.claude/hooks-config.json`).
-4. **Honest scope note.** That periodic re-surfacing rides on your prompts, so it's
+4. **Handoffs carry the narrative.** `/claude-state-drift:handoff` first walks the
+   normal reviewed `state.json` update, then parks a narrative handoff
+   (`.claude/handoffs/latest.md`) that the next session's orientation embeds —
+   rendered as clearly-marked untrusted briefing data, and superseded automatically
+   the moment `state.json` is updated again or a newer handoff lands. When a
+   session's context use crosses a threshold (75% when the exact figure is
+   available locally, else a ~150k-token estimate from the transcript size), the
+   prompt hook injects a one-line suggestion to compose one — at most once per
+   session, never on the same prompt as the focus re-injection.
+   `STATE_HANDOFF_NUDGE_DISABLE=1` turns the nudge off;
+   `STATE_HANDOFF_NUDGE_PCT` / `STATE_HANDOFF_NUDGE_TOKENS` tune the thresholds.
+5. **Honest scope note.** That periodic re-surfacing rides on your prompts, so it's
    *interactive-only*: a headless run with no user turns — `claude -p`, an
    autonomously-driven SDK loop, CI — gets the one-time session-start orientation and
    nothing recurring. Everything is computed from local files and local git; nothing
@@ -136,6 +154,7 @@ a hook. Plugin commands are always namespaced in the Claude Code CLI — type
 | `/claude-state-drift:re-anchor` | Audit the current session against the objective and report alignment: on-track, mild drift, or significant drift. |
 | `/claude-state-drift:stats` | Show this project's own telemetry — sessions, per-injection token cost, activity, and nudge→update conversion — computed locally (needs `CLAUDE_HOOK_LOG=1`). |
 | `/claude-state-drift:clean` | Keep `state.json` lean: dry-runs `state-clean`, shows which old `done` deliverables would be archived, confirms with you, then archives them (to an append-only `state-archive.jsonl`; reversible). |
+| `/claude-state-drift:handoff` | End the session cleanly: runs the reviewed `update-state` flow first, then composes a narrative handoff that the next session in this project auto-loads (until a newer handoff or state update supersedes it). |
 
 Outside the CLI (e.g. the desktop app), typed plugin commands aren't supported —
 just ask in plain words ("where am I?", "update the project state", "are we still
@@ -168,6 +187,8 @@ bloat. It isn't — and almost all of the cost is paid once, at session start:
 |---|---|---|
 | Orientation block | once, at session start | ~700–2,000 tokens |
 | Focus re-injection | every 6th prompt (tunable) | ~180 tokens |
+| Handoff embed (only when one is parked and still fresh) | once, at session start | body capped at 6 KB |
+| Handoff nudge (only at high context use) | at most once per session | one line |
 
 For a typical long session that's roughly **1,000–4,000 tokens total — under 1–2%
 of a 200K window** — and most of it is the one-time orientation block, which
@@ -235,6 +256,9 @@ session while the plugin is enabled — just ask Claude to run them:
   cost, activity, and nudge→update conversion — computed locally from the opt-in
   hook log, when `CLAUDE_HOOK_LOG=1`).
 - `state-history` — append an entry to the per-project transition log.
+- `state-handoff` — park (`write`) and render (`read --for-orient`) the per-project
+  session handoff that the orientation block embeds (see
+  [SCHEMA.md](SCHEMA.md) for the file format and supersession rule).
 - `state-clean` — keep `state.json` lean: archive old `done` deliverables into an
   append-only `.claude/state-archive.jsonl` (dry-run by default; `--apply` to write;
   `--keep N`/`--older-than DAYS` tune it). Lossless — git and the archive are the

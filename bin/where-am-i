@@ -271,16 +271,66 @@ def memory_crossrefs(root: Path, state: dict) -> list[str]:
     return out
 
 
+FOCUS_TRIM_CODEPOINTS = 300
+FOCUS_TRIM_NOTE = "… (full focus in state.json; handoff below is fresher)"
+
+
+def handoff_section(root: Path):
+    """Injectable `## HANDOFF (...)` section, a one-line warning, or None.
+
+    csd-handoff-v0.4.0 Task 3: shells out to the sibling `state-handoff read
+    --for-orient` tool (Tasks 1+2) rather than importing it, keeping the two
+    CLIs independently invocable. Fail-open by construction, mirroring
+    compute_staleness/memory_crossrefs: any error/timeout returns None so a
+    missing/broken state-handoff never breaks orientation.
+    """
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state-handoff")
+    try:
+        r = subprocess.run(
+            [sys.executable, tool, "read", "--for-orient", str(root)],
+            capture_output=True, text=True, timeout=5,
+        )
+        out = r.stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def render(state: dict, root: Path) -> str:
     lines: list[str] = []
     lines.append("=== WHERE YOU ARE ===")
     lines.append(f"Project: {root.name}")
 
+    # Task 3: resolved once, early, so both the focus-tail trim below and the
+    # section append further down agree on the same read.
+    ho = handoff_section(root)
+
     version = state.get("version", "(unset)")
     objective = _flatten(state.get("objective", "(no objective set)"))
     focus = _flatten(state.get("current_focus", "(no current focus set)"))
+    focus_warning = None
+    # Contract with `state-handoff read --for-orient`: it returns either a real
+    # section starting `## HANDOFF` (embed it, trim the generic focus tail) or a
+    # one-line warning starting `(` (mismatch/malformed — surface it, keep focus
+    # intact). The classification below hinges on that prefix distinction.
+    if ho and ho.startswith("## HANDOFF"):
+        # A fresh handoff is present and will be embedded below (more current
+        # than this generic tail) — trim the tail, keep the head so the
+        # objective/version/focus-opener context isn't lost.
+        if len(focus) > FOCUS_TRIM_CODEPOINTS:
+            focus = focus[:FOCUS_TRIM_CODEPOINTS] + FOCUS_TRIM_NOTE
+    elif ho:
+        # One-line warning (mismatch/malformed) — never render a body next to
+        # a warning about that body; keep focus intact and surface the warning.
+        focus_warning = ho
+        ho = None
     lines.append(f"Version: {version} | Objective: {objective}")
     lines.append(f"Focus:   {focus}")
+    if focus_warning:
+        lines.append(focus_warning)
+    if ho:
+        lines.append("")
+        lines.append(ho)
 
     current_norm = normalize_version(version)
     # Type-guard: tolerate malformed state.json where collections are wrong type
@@ -450,6 +500,15 @@ def render_stats(root) -> str:
                    f"median ~{round(sr['median_minutes'])} min to next update")
     else:
         out.append(f"  Staleness resolved: 0/{sr['total']}")
+    dp = s["decision_prompts"]
+    if dp["recommended"]:
+        line = (f"  Recommended-option overrides: {dp['overridden']}/{dp['recommended']} "
+                f"({round(dp['override_rate'] * 100)}%)")
+        # Interpretive suffix only past a minimum sample — at n=3 a 0% rate
+        # is noise, not evidence of rubber-stamping.
+        if dp["recommended"] >= 10 and dp["override_rate"] <= 0.05:
+            line += " — sustained ~0% suggests approvals aren't being scrutinized"
+        out.append(line)
     if s["reanchor_verdicts"]:
         dist = ", ".join(f"{k}:{n}" for k, n in sorted(s["reanchor_verdicts"].items()))
         out += ["", f"Re-anchor verdicts (SELF-ASSESSED — not a publishable efficacy stat): {dist}"]

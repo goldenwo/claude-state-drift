@@ -14,8 +14,14 @@
 #   - session_id unavailable from hook input
 #
 # Configuration via environment:
-#   FOCUS_CHECK_EVERY=N    — re-anchor cadence (default 6, min 1)
-#   FOCUS_CHECK_DISABLE=1  — disable entirely
+#   FOCUS_CHECK_EVERY=N            — re-anchor cadence (default 6, min 1)
+#   FOCUS_CHECK_DISABLE=1          — disable entirely (also disables the
+#                                    handoff-pressure nudge, which lives in
+#                                    this hook and exits with it)
+#   STATE_HANDOFF_NUDGE_DISABLE=1  — disable only the handoff-pressure nudge
+#   STATE_HANDOFF_NUDGE_PCT=N      — nudge threshold, exact-% path (default 75)
+#   STATE_HANDOFF_NUDGE_TOKENS=N   — nudge threshold, token-estimate fallback
+#                                    (default 150000)
 #
 # This is the spec-review-loop's Reflexion-style re-anchor pattern, scoped
 # to general work instead of review rounds. UserPromptSubmit is the right
@@ -130,8 +136,74 @@ fi
 [ -z "${INPUT}" ] && INPUT="$(cat 2>/dev/null)"
 [ -z "${INPUT}" ] && exit 0
 
-SESSION_ID=$(printf '%s' "${INPUT}" | jq -r '.session_id // .sessionId // ""' 2>/dev/null)
+# Single jq spawn pulls both session_id and transcript_path (the latter
+# needed only by the handoff-pressure nudge's token-estimate fallback
+# below) — avoids a second subprocess in the common no-pressure hot path.
+_SID_TP=$(printf '%s' "${INPUT}" | jq -r '((.session_id // .sessionId // "") | tostring) + "\t" + ((.transcript_path // "") | tostring)' 2>/dev/null)
+SESSION_ID="${_SID_TP%%$'\t'*}"
+NUDGE_TRANSCRIPT_PATH="${_SID_TP#*$'\t'}"
 [ -z "${SESSION_ID}" ] && exit 0
+
+# ---- handoff-pressure nudge (CSD v0.4.0) — fires at most once per session,
+# BEFORE the periodic re-anchor gate below (same-prompt exclusivity: only
+# one CSD injection per prompt — if the nudge fires it exits before the
+# counter-mod gate can also emit <focus-check>). Reads the exact context %
+# from claude-ctx's session-status file when present; falls back to a
+# transcript-byte/4 token estimate (never renders a fabricated %). Sentinel
+# path uses a sanitized session id (never the raw value) so a hostile
+# session_id can't path-traverse the sentinel filename.
+if [ "${STATE_HANDOFF_NUDGE_DISABLE:-0}" != "1" ]; then
+    NUDGE_SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+    if [ -n "$NUDGE_SAFE_SID" ]; then
+        NUDGE_SENT_DIR="${CWD}/.claude/.handoff-nudge"
+        NUDGE_SENT="${NUDGE_SENT_DIR}/${NUDGE_SAFE_SID}"
+        if [ ! -f "$NUDGE_SENT" ]; then
+            NUDGE_MSG=""
+            # SAFE_SID (not the raw session_id) in the path: a hostile id
+            # can't traverse to an attacker-chosen *.json; legit ids are
+            # UUID-shaped so sanitize is the identity for them.
+            NUDGE_SS_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-status/${NUDGE_SAFE_SID}.json"
+            if [ -f "$NUDGE_SS_FILE" ]; then
+                NUDGE_USED_PCT=$(jq -r '.used_pct // empty' "$NUDGE_SS_FILE" 2>/dev/null)
+                # numeric guard (house idiom, cf. NUDGE_TBYTES below): the value
+                # feeds an awk compare and the rendered message — non-numeric
+                # content (incl. a used_pct crafted as awk program text) is
+                # dropped, never interpolated.
+                case "$NUDGE_USED_PCT" in ''|.|*[!0-9.]*|*.*.*) NUDGE_USED_PCT="" ;; esac
+                if [ -n "$NUDGE_USED_PCT" ]; then
+                    NUDGE_PCT_THRESH="${STATE_HANDOFF_NUDGE_PCT:-75}"
+                    case "$NUDGE_PCT_THRESH" in ''|.|*[!0-9.]*|*.*.*) NUDGE_PCT_THRESH=75 ;; esac
+                    if awk -v p="$NUDGE_USED_PCT" -v t="$NUDGE_PCT_THRESH" 'BEGIN{exit !(p+0 >= t+0)}' 2>/dev/null; then
+                        NUDGE_MSG="context ~${NUDGE_USED_PCT%.*}%: consider /claude-state-drift:handoff before it gets tight"
+                    fi
+                fi
+            elif [ -n "$NUDGE_TRANSCRIPT_PATH" ] && [ -f "$NUDGE_TRANSCRIPT_PATH" ]; then
+                NUDGE_TBYTES=$(wc -c < "$NUDGE_TRANSCRIPT_PATH" 2>/dev/null | tr -d '[:space:]')
+                case "$NUDGE_TBYTES" in ''|*[!0-9]*) NUDGE_TBYTES=0 ;; esac
+                NUDGE_TOK=$(( NUDGE_TBYTES / 4 ))
+                NUDGE_TOK_THRESH="${STATE_HANDOFF_NUDGE_TOKENS:-150000}"
+                if [ "$NUDGE_TOK" -ge "$NUDGE_TOK_THRESH" ]; then
+                    NUDGE_MSG="context estimate ~$(( NUDGE_TOK / 1000 ))k tokens: consider /claude-state-drift:handoff before it gets tight"
+                fi
+            fi
+            if [ -n "$NUDGE_MSG" ]; then
+                mkdir -p "$NUDGE_SENT_DIR" 2>/dev/null
+                # self-ignoring dir: consumer repos (where no committed
+                # .claude/.gitignore covers this) never see it in git status.
+                # Rewritten every fire so its mtime stays ahead of the prune.
+                printf '*\n' > "$NUDGE_SENT_DIR/.gitignore" 2>/dev/null
+                : > "$NUDGE_SENT" 2>/dev/null
+                # opportunistic 48h prune of stale sentinels (best-effort, never fatal)
+                find "$NUDGE_SENT_DIR" -type f -mmin +2880 -delete 2>/dev/null
+                TELEM_EXTRA=$(printf '"nudge":1,"session":"%s"' "$NUDGE_SAFE_SID")
+                TELEM_EMIT=1
+                jq -n --arg ctx "$NUDGE_MSG" \
+                    '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}}'
+                exit 0
+            fi
+        fi
+    fi
+fi
 
 TMP="${TMPDIR:-/tmp}"
 COUNTER_FILE="${TMP}/.claude-focus-check-${SESSION_ID}"
@@ -230,7 +302,7 @@ case "${CTX_BYTES}" in ''|*[!0-9]*) CTX_BYTES=0 ;; esac
 # session id (sanitized to whitelist-safe charset) lets offline analysis
 # count distinct sessions and join focus-check activity to the same
 # session's state-history transitions.
-SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+telem_safe_sid "$SESSION_ID"
 TELEM_EXTRA=$(printf '"counter":%d,"ctx_bytes":%s,"session":"%s"' "${COUNTER}" "${CTX_BYTES}" "${SAFE_SID}")
 
 TELEM_EMIT=1   # F-prep.3 telemetry: distinguish actual-emit from silent-skip paths

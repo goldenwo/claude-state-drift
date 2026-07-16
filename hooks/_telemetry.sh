@@ -55,6 +55,19 @@ _telem_now_ms() {
     fi
 }
 
+# Sanitize a session id for embedding in a TELEM_EXTRA fragment: sets
+# SAFE_SID to $1 stripped to [A-Za-z0-9_-] — the subset of telem_end's
+# whitelist (see below) that is also safe inside a quoted JSON string value.
+# Sets a variable instead of printing so hot-path hooks pay no
+# command-substitution fork. SINGLE definition point — this replaced six
+# verbatim per-hook copies (2026-07-03); keep in lockstep with the telem_end
+# whitelist, and note one drifted copy used to silently drop that hook's
+# entire enrichment fragment. The --test block below proves the
+# sanitizer-output-survives-the-whitelist contract against the real telem_end.
+telem_safe_sid() {
+    SAFE_SID="${1//[^A-Za-z0-9_-]/}"
+}
+
 telem_start() {
     [ "${CLAUDE_HOOK_LOG:-0}" = "1" ] || return 0
     _TELEM_START_MS=$(_telem_now_ms 2>/dev/null) || _TELEM_START_MS=""
@@ -134,3 +147,53 @@ telem_end() {
             >> "$log_file" 2>/dev/null || true
     fi
 }
+
+# Self-test (mirrors hooks/_python.sh): NEVER runs when sourced by a hook —
+# only on direct exec with --test. Exit 0 iff all sub-checks pass.
+if [ "${BASH_SOURCE[0]}" = "${0}" ] && [ "${1:-}" = "--test" ]; then
+    _tt_pass=0
+    _tt_fail=0
+    _tt_ok()  { _tt_pass=$((_tt_pass + 1)); echo "  PASS: $1"; }
+    _tt_bad() { _tt_fail=$((_tt_fail + 1)); echo "  FAIL: $1"; }
+
+    echo "=== _telemetry.sh self-test ==="
+
+    # T1: clean UUID-style sid passes through unchanged
+    telem_safe_sid "7200a7e9-6a33-4133-94cf-9d4621482656"
+    [ "$SAFE_SID" = "7200a7e9-6a33-4133-94cf-9d4621482656" ] \
+        && _tt_ok "T1 clean sid unchanged" || _tt_bad "T1 clean sid unchanged"
+
+    # T2: hostile chars (quotes, commas, colons, spaces, shell metachars,
+    # backslash) are stripped — nothing that could escape a JSON string or
+    # trip the fragment whitelist survives
+    telem_safe_sid 'evil"sid, with:junk $(rm -rf /)\;'
+    [ "$SAFE_SID" = "evilsidwithjunkrm-rf" ] \
+        && _tt_ok "T2 hostile chars stripped" || _tt_bad "T2 hostile chars stripped (got: $SAFE_SID)"
+
+    # T3: empty input stays empty (callers fall back to \"unknown\")
+    telem_safe_sid ""
+    [ -z "$SAFE_SID" ] && _tt_ok "T3 empty stays empty" || _tt_bad "T3 empty stays empty"
+
+    # T4: CONTRACT — a fragment built from a sanitized hostile sid survives
+    # the REAL telem_end whitelist (record written WITH the session field).
+    # This is the lockstep canary: if the telem_end whitelist ever tightens
+    # past [A-Za-z0-9_-] without this sanitizer following, T4 goes red.
+    _tt_tmp=$(mktemp -d)
+    mkdir -p "$_tt_tmp/.claude"
+    (
+        CLAUDE_HOOK_LOG=1
+        telem_safe_sid 'sid"with,bad:chars and spaces'
+        telem_start
+        TELEM_EXTRA=$(printf '"session":"%s"' "$SAFE_SID")
+        TELEM_EMIT=1
+        telem_end telemetry-self-test.sh "$TELEM_EMIT" "$_tt_tmp"
+    )
+    grep -q '"session":"sidwithbadcharsandspaces"' "$_tt_tmp/.claude/.hook-log.jsonl" 2>/dev/null \
+        && _tt_ok "T4 sanitized sid survives the real telem_end whitelist" \
+        || _tt_bad "T4 sanitized sid survives the real telem_end whitelist"
+    rm -rf "$_tt_tmp"
+
+    echo "_telemetry.sh self-test: $_tt_pass passed, $_tt_fail failed"
+    [ "$_tt_fail" = "0" ] || exit 1
+    exit 0
+fi

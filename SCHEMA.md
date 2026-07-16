@@ -84,3 +84,30 @@ Unknown keys are ignored; a missing file means every hook uses its built-in defa
 Precedence per knob: the hook's environment variable (if set) wins, then this file,
 then the hook's built-in default. (`STATE_TRACK_DISABLE=1` also exists, env-only,
 to turn off `state-track-commit` entirely.)
+
+## Session handoffs — `.claude/handoffs/`
+
+`/claude-state-drift:handoff` parks a narrative handoff at `.claude/handoffs/latest.md`
+(plus a timestamped copy under `.claude/handoffs/archive/`). The bundled
+`state-handoff` tool writes the file: the frontmatter is machine-written, the body is
+the session's narrative. `state-handoff write` also keeps the directory gitignored
+(appending a `handoffs/` entry to `.claude/.gitignore` when needed).
+
+| Frontmatter field | Meaning |
+|---|---|
+| `project_path` | Absolute path of the project the handoff belongs to. A handoff whose `project_path` doesn't match the current project is never embedded — a one-line warning renders instead. |
+| `composed_at` | UTC timestamp of composition. |
+| `session_id` | Id of the composing session. |
+| `state_last_updated` | `state.json`'s `last_updated` at compose time. |
+
+**Supersession rule:** the next session's orientation embeds `latest.md` only while it
+is *fresher* than `state.json`. As soon as `state.json`'s `last_updated` moves past
+`composed_at` (with a 5-second tolerance, because the handoff flow updates state
+first), or a newer handoff lands, orientation renders plain again. The rendered body
+is truncated at the last complete line before 6 KB and always appears inside an
+explicit untrusted-content boundary — briefing data, not instructions.
+
+**Nudge knobs (env-only):** `STATE_HANDOFF_NUDGE_PCT` (default `75`, exact-%
+threshold), `STATE_HANDOFF_NUDGE_TOKENS` (default `150000`, transcript-size fallback
+threshold), `STATE_HANDOFF_NUDGE_DISABLE=1` (turn the nudge off). The nudge lives in
+the `focus-check` hook, so `FOCUS_CHECK_DISABLE=1` disables it as well.

@@ -253,7 +253,7 @@ case "$CTX_BYTES" in ''|*[!0-9]*) CTX_BYTES=0 ;; esac
 # conversion metric: state-history transitions carry session_id, so a nudge
 # and a subsequent same-session state update can be matched without noisy
 # time-proximity heuristics.
-SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+telem_safe_sid "$SESSION_ID"
 TELEM_EXTRA=$(printf '"commit":"%s","ctx_bytes":%s,"session":"%s"' "${LATEST_COMMIT:0:7}" "$CTX_BYTES" "$SAFE_SID")
 
 TELEM_EMIT=1   # F-prep.3 telemetry: actual nudge emission

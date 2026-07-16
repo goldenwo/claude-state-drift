@@ -272,6 +272,7 @@ _ORIENT_HOOK = "session-start-orient.sh"
 _FOCUS_HOOK = "focus-check.sh"
 _COMMIT_HOOK = "state-track-commit.sh"
 _STALENESS_HOOK = "state-staleness.sh"
+_DECISION_HOOK = "decision-prompt-telemetry.sh"
 
 
 def hook_log_path(root):
@@ -390,6 +391,25 @@ def compute_stats(hook_records, history_records, bytes_per_token=4):
             stale_resolved += 1
             res_deltas_min.append((follow - nudge_dt).total_seconds() / 60.0)
 
+    # C6 decision-prompt calibration. Counts are validated and clamped PER
+    # RECORD (followed_i <= rec_i) so one malformed log line can neither push
+    # the override rate negative nor erase genuine override signal from the
+    # healthy records around it. Bools are excluded explicitly — bool is a
+    # subclass of int, so `"q_rec": true` would otherwise count as 1.
+    decisions = _emits_for(_DECISION_HOOK)
+
+    def _count(rec, key):
+        v = rec.get(key)
+        ok = isinstance(v, int) and not isinstance(v, bool) and v >= 0
+        return v if ok else 0
+
+    dec_rec = dec_followed = dec_neutral = 0
+    for r in decisions:
+        rec_n = _count(r, "q_rec")
+        dec_rec += rec_n
+        dec_followed += min(_count(r, "q_rec_followed"), rec_n)
+        dec_neutral += _count(r, "q_neutral")
+
     verdicts = {}
     for r in history_records:
         if r.get("event") == "re-anchor":
@@ -410,6 +430,12 @@ def compute_stats(hook_records, history_records, bytes_per_token=4):
             "total": stale_total, "resolved": stale_resolved,
             "median_minutes": (_percentile(res_deltas_min, 50)
                                if res_deltas_min else None)},
+        "decision_prompts": {
+            "recommended": dec_rec, "followed": dec_followed,
+            "overridden": dec_rec - dec_followed,
+            "override_rate": (((dec_rec - dec_followed) / dec_rec)
+                              if dec_rec else None),
+            "neutral": dec_neutral},
         "reanchor_verdicts": verdicts,
     }
 

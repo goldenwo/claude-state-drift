@@ -143,7 +143,7 @@ fi
 # commits behind your work"). A bloat-only emit records the archivable count
 # instead; it still counts as a state-staleness.sh fire in --stats activity
 # (acceptable conflation — bloat nudges are rare and stop once you run state-clean).
-SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
+telem_safe_sid "$SESSION_ID"
 if [ -n "$STALE_BLOCK" ]; then
     TELEM_EXTRA=$(printf '"lag_hours":%s,"commits_ahead":%s,"session":"%s"' "$STALE_LAG" "$STALE_COMMITS" "$SAFE_SID")
 else
