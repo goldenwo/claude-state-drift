@@ -56,10 +56,14 @@ STATE_FILE="$CWD/.claude/state.json"
 
 # #78 (R4 N3) untrusted-CWD validation — defense-in-depth. If a trusted root is
 # known ($CLAUDE_PROJECT_DIR set), refuse to chdir into a $CWD that escapes it.
+# Compare with separators NORMALIZED (\ → /): Windows payloads carry backslash
+# .cwd vs forward-slash $CLAUDE_PROJECT_DIR — the raw compare silent-skipped
+# every real fire (T146d regression-lock; see state-track-commit.sh #78 note).
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
-    case "${CWD%/}" in
-        "${CLAUDE_PROJECT_DIR%/}"|"${CLAUDE_PROJECT_DIR%/}"/*) ;;  # in-root → proceed
-        *) exit 0 ;;                                              # escapes trusted root → silent-skip
+    CWD_CMP="${CWD//\\//}"; ROOT_CMP="${CLAUDE_PROJECT_DIR//\\//}"
+    case "${CWD_CMP%/}" in
+        "${ROOT_CMP%/}"|"${ROOT_CMP%/}"/*) ;;  # in-root → proceed
+        *) exit 0 ;;                           # escapes trusted root → silent-skip
     esac
 fi
 

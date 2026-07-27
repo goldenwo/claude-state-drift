@@ -43,9 +43,15 @@ INPUT="$(cat 2>/dev/null)"
 
 # Cheap bash-only short-circuit BEFORE invoking jq — this hook fires on every
 # PostToolUse(Bash), most of which aren't git commits. Substring check skips
-# jq parsing entirely for unrelated commands.
+# jq parsing entirely for unrelated commands. Match BOTH serializations
+# ('"tool_name":"Bash"' compact, '"tool_name": "Bash"' pretty-printed):
+# live Claude Code payloads are compact (captured 2026-07-26), the pretty
+# variant is cheap insurance against serializer variance across assistants/
+# versions (Codex/Copilot ports, fixtures; T147c). NOTE: the 2026-07 zero-
+# nudge telemetry was NOT this filter — the root cause was the #78 separator
+# mismatch below. The jq extraction remains the authoritative filter.
 case "$INPUT" in
-    *'"tool_name":"Bash"'*) ;;
+    *'"tool_name":"Bash"'* | *'"tool_name": "Bash"'*) ;;
     *) exit 0 ;;
 esac
 case "$INPUT" in
@@ -104,10 +110,17 @@ STATE_FILE="$CWD/.claude/state.json"
 # (no realpath spawn — this is on the every-commit hot path). When
 # $CLAUDE_PROJECT_DIR is unset (legitimate: harness tests, some launch
 # modes) the check is skipped entirely so behavior is UNCHANGED.
+# Compare with separators NORMALIZED (\ → /): on Windows the payload
+# .cwd arrives BACKSLASH form while $CLAUDE_PROJECT_DIR is exported
+# forward-slash — the raw compare never matched, silent-skipping EVERY
+# real fire for ~10 weeks (0 emits in 2530 dispatches, 2026-05-17..
+# 2026-07-26; T146c/T146d regression-lock). Filesystem ops below keep
+# the original $CWD (msys accepts both forms).
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
-    case "${CWD%/}" in
-        "${CLAUDE_PROJECT_DIR%/}"|"${CLAUDE_PROJECT_DIR%/}"/*) ;;  # in-root → proceed (normal case)
-        *) exit 0 ;;                                              # escapes trusted root → silent-skip
+    CWD_CMP="${CWD//\\//}"; ROOT_CMP="${CLAUDE_PROJECT_DIR//\\//}"
+    case "${CWD_CMP%/}" in
+        "${ROOT_CMP%/}"|"${ROOT_CMP%/}"/*) ;;  # in-root → proceed (normal case)
+        *) exit 0 ;;                           # escapes trusted root → silent-skip
     esac
 fi
 
