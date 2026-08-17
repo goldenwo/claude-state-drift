@@ -136,7 +136,196 @@ def select_archivable(deliverables, keep, older_than, now):
     return archivable
 
 
+def run_tests():
+    """Self-test. state-clean is the only untested bin/ tool that MUTATES
+    state.json, which is why it gets a real suite rather than a smoke check.
+
+    The cases that matter most are the ones protecting against silent DATA
+    LOSS, because this tool's failure mode is not a crash — it is quietly
+    archiving something it should have kept:
+
+      C3  an undateable `completed_at` must never be archived (nothing can
+          age it, so archiving it is a guess);
+      C6  the keep-N protection must cover the N most-recently-COMPLETED
+          entries, not the first N in list order. select_archivable sorts
+          before slicing; a regression that dropped the sort would still
+          pass C2 (which happens to be ordered) and lose real work here;
+      I3  the archive is append-only — a regression that opened it "w"
+          instead of "a" destroys every prior archive and would otherwise
+          look like a clean run;
+      I5  non-`done` deliverables and open_questions are out of scope
+          entirely and must survive --apply untouched.
+    """
+    import contextlib
+    import io
+    import tempfile
+
+    passed = failed = 0
+    cases = []
+
+    def check(name, cond):
+        nonlocal passed, failed
+        if cond:
+            passed += 1
+        else:
+            failed += 1
+            cases.append(f"  FAIL  {name}")
+
+    now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+
+    def d(did, status="done", completed=None):
+        e = {"id": did, "status": status}
+        if completed is not None:
+            e["completed_at"] = completed
+        return e
+
+    # --- select_archivable (pure) --------------------------------------
+    old, recent = "2026-01-01", "2026-08-04"
+    check("C1 non-done statuses are never archivable",
+          select_archivable([d("a", "in_progress", old), d("b", "deferred", old),
+                             d("c", "blocked", old)], 0, 30, now) == [])
+    got = select_archivable([d("old1", completed=old), d("old2", completed=old)], 1, 30, now)
+    check("C2 keep-N protects the N most recent", len(got) == 1)
+    check("C3 undateable completed_at is never archived",
+          select_archivable([d("nodate")], 0, 30, now) == [])
+    check("C3b unparseable completed_at is never archived",
+          select_archivable([d("bad", completed="not-a-date")], 0, 30, now) == [])
+    check("C4 entries younger than the cutoff are kept",
+          select_archivable([d("fresh", completed=recent)], 0, 30, now) == [])
+    check("C5 keep=0 allows every aged entry",
+          len(select_archivable([d("x", completed=old), d("y", completed=old)], 0, 30, now)) == 2)
+    # C6 TEETH: newest-first ordering. The oldest entry is FIRST in the list,
+    # so a regression slicing list order instead of sorted order protects the
+    # wrong one and archives the newest — real work lost.
+    ordered = [d("oldest", completed="2026-01-01"), d("newest", completed="2026-06-01")]
+    got = select_archivable(ordered, 1, 30, now)
+    check("C6 keep-N protects the newest, not the first in list order",
+          [e["id"] for e in got] == ["oldest"])
+
+    # --- parse_args ----------------------------------------------------
+    check("P1 unknown flag is a usage error", parse_args(["--nope"]) is None)
+    check("P2 non-integer --keep is a usage error", parse_args(["--keep", "x"]) is None)
+    check("P3 negative --keep is a usage error", parse_args(["--keep", "-1"]) is None)
+    check("P4 --older-than 0 is accepted", (parse_args(["--older-than", "0"]) or {}).get("older_than") == 0)
+    check("P5 --root without a value is a usage error", parse_args(["--root"]) is None)
+    defaults = parse_args([]) or {}
+    check("P6 defaults are keep=10 older_than=30 dry-run",
+          defaults.get("keep") == 10 and defaults.get("older_than") == 30
+          and defaults.get("apply") is False)
+
+    # --- integration (real files, real --apply) -------------------------
+    def fixture(tmp, focus="head ===PRIOR=== tail"):
+        root = Path(tmp)
+        (root / ".claude").mkdir(parents=True, exist_ok=True)
+        state = {
+            "schema_version": 1, "objective": "o", "version": "9.9.9",
+            "current_focus": focus,
+            "deliverables": [
+                d("aged", completed="2026-01-01"),
+                d("keeper", "in_progress"),
+                d("deferred-one", "deferred"),
+            ],
+            "open_questions": [{"q": "still open", "asked_at": "2026-01-01"}],
+            "last_updated": "2026-01-01T00:00:00Z",
+        }
+        (root / ".claude" / "state.json").write_text(
+            json.dumps(state, indent=2), encoding="utf-8")
+        return root
+
+    def run(root, *flags):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--root", str(root), "--keep", "0", *flags])
+        return rc, buf.getvalue()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fixture(tmp)
+        sp = root / ".claude" / "state.json"
+        before = sp.read_bytes()
+        rc, _ = run(root)
+        check("I1 dry-run leaves state.json byte-identical",
+              rc == 0 and sp.read_bytes() == before)
+        check("I1b dry-run creates no archive",
+              not (root / ".claude" / ARCHIVE_FILENAME).is_file())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fixture(tmp)
+        sp, ap = root / ".claude" / "state.json", root / ".claude" / ARCHIVE_FILENAME
+        rc, _ = run(root, "--apply")
+        st = json.loads(sp.read_text(encoding="utf-8"))
+        ids = [x["id"] for x in st["deliverables"]]
+        check("I2 --apply removes the archived entry from state.json",
+              rc == 0 and "aged" not in ids)
+        check("I2b --apply appends it to the archive",
+              ap.is_file() and '"aged"' in ap.read_text(encoding="utf-8"))
+        rec = json.loads(ap.read_text(encoding="utf-8").splitlines()[0])
+        check("I4 archived record carries archived_at", "archived_at" in rec)
+        check("I5 non-done deliverables survive --apply",
+              "keeper" in ids and "deferred-one" in ids)
+        check("I5b open_questions survive --apply",
+              st.get("open_questions") and st["open_questions"][0]["q"] == "still open")
+        check("I8 no .clean-tmp is left behind",
+              not list((root / ".claude").glob("*.clean-tmp")))
+        # I3 TEETH: append-only. Re-seed a second archivable entry and apply
+        # again; the FIRST archive line must still be there afterwards.
+        st["deliverables"].append(d("aged2", completed="2026-01-02"))
+        sp.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        run(root, "--apply")
+        lines = [ln for ln in ap.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        check("I3 archive is append-only across runs (prior record survives)",
+              len(lines) == 2 and '"aged"' in lines[0] and '"aged2"' in lines[1])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fixture(tmp)
+        sp = root / ".claude" / "state.json"
+        run(root, "--apply")
+        check("I6 current_focus untouched without --strip-prior",
+              json.loads(sp.read_text(encoding="utf-8"))["current_focus"]
+              == "head ===PRIOR=== tail")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fixture(tmp)
+        sp = root / ".claude" / "state.json"
+        run(root, "--apply", "--strip-prior")
+        check("I7 --strip-prior keeps only the head before the first marker",
+              json.loads(sp.read_text(encoding="utf-8"))["current_focus"] == "head")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fixture(tmp, focus="no marker here")
+        sp = root / ".claude" / "state.json"
+        run(root, "--apply", "--strip-prior")
+        check("I7b --strip-prior is a no-op when no marker is present",
+              json.loads(sp.read_text(encoding="utf-8"))["current_focus"] == "no marker here")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--root", str(Path(tmp) / "nope")])
+        check("I9 missing state.json exits 1", rc == 1)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / ".claude").mkdir(parents=True)
+        (root / ".claude" / "state.json").write_text("{not json", encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--root", str(root)])
+        check("I10 malformed state.json exits 1", rc == 1)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / ".claude").mkdir(parents=True)
+        (root / ".claude" / "state.json").write_text("[1,2]", encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--root", str(root)])
+        check("I10b non-object state.json exits 1", rc == 1)
+
+    for line in cases:
+        print(line)
+    print(f"--- state-clean --test: {passed} passed, {failed} failed ---")
+    return 1 if failed else 0
+
+
 def main(argv):
+    if argv and argv[0] == "--test":
+        return run_tests()
     opts = parse_args(argv)
     if opts is None:
         return 2

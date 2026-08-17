@@ -8,6 +8,11 @@ Verbs:
 
 Mechanics only — the MODEL composes the prose (see skills/handoff). Fail-open philosophy:
 read never raises for a fresh session; write fails loud (the composing session is interactive).
+
+fleet-steward P1 Task 3: write appends a sanitized steward claims-verdict
+block at the handoff foot (checks/handoff_claims.py) — default-on, disabled
+with STEWARD_HANDOFF_CLAIMS=0, a silent no-op when the steward bits are
+unavailable (the public plugin cut ships this file without checks/).
 """
 import json, os, re, subprocess, sys, tempfile
 from datetime import datetime, timezone
@@ -94,6 +99,56 @@ def _ensure_gitignored(root):
         return f"warning: could not gitignore .claude/{HANDOFF_DIR}/ — check it is not committed"
 
 
+def _load_handoff_claims():
+    """Lazy import of checks/handoff_claims.py -- returns the module, or
+    None when it (or its own dependencies, e.g. bin/_steward.py) are
+    unimportable. This is exactly the shape the public plugin cut is in:
+    bin/state-handoff ships, checks/ and bin/_steward.py do not (checks/
+    is outside the [WATCH] dirs the public-cut build enumerates at all;
+    bin/_steward.py is manifest [PRIVATE]) -- so this import fails there,
+    and write_handoff() must behave byte-identically to its pre-embed
+    self (fleet-steward P1 Task 3 decision #1).
+
+    Catches `Exception` broadly, NOT just `ImportError` (post-review fix:
+    the module body of handoff_claims.py -- or any transitively-imported
+    sibling under checks/, or bin/_steward.py -- runs INSIDE this same
+    try block during the `import` statement itself, so a bug or a
+    version-skew failure there (e.g. an AttributeError from a renamed
+    symbol) is exactly as "the steward stack is broken" as a missing
+    file, and must degrade the same way -- an import-time crash here must
+    never take `state-handoff write` down with it, per this module's own
+    contract). `KeyboardInterrupt`/`SystemExit` are NOT caught (they are
+    not `Exception` subclasses) and propagate as normal."""
+    try:
+        checks_dir = str(Path(__file__).resolve().parent.parent / "checks")
+        if checks_dir not in sys.path:
+            sys.path.insert(0, checks_dir)
+        import handoff_claims
+        return handoff_claims
+    except Exception:  # noqa: BLE001 -- any import/load-time failure degrades to "unavailable", never crashes the write
+        return None
+
+
+def _steward_claims_block(root, body):
+    """The sanitized claims-verdict block to append at the handoff foot
+    (fleet-steward P1 Task 3, spec Section 2: "default-on but clearly
+    labeled"), or None when disabled (STEWARD_HANDOFF_CLAIMS=0, exact
+    string) or unavailable (the public plugin cut, or ANY failure
+    importing/running the steward bits). Never raises: a broken or
+    absent steward stack must never break a handoff write -- it silently
+    degrades to today's behavior instead."""
+    if os.environ.get("STEWARD_HANDOFF_CLAIMS") == "0":
+        return None
+    module = _load_handoff_claims()
+    if module is None:
+        return None
+    try:
+        block = module.verify(root, body)
+    except Exception:
+        return None
+    return block or None
+
+
 def write_handoff(root, body, session_id):
     root = Path(root)
     if not body.strip():
@@ -107,7 +162,10 @@ def write_handoff(root, body, session_id):
         pass
     fm = (f"---\nproject_path: {norm_path(root)}\ncomposed_at: {composed}\n"
           f"session_id: {sid}\nstate_last_updated: {state_lu}\n---\n")
-    text = fm + body
+    claims_block = _steward_claims_block(root, body)
+    full_body = body if claims_block is None else (
+        body + ("" if body.endswith("\n") else "\n") + "\n" + claims_block + "\n")
+    text = fm + full_body
     d = handoff_dir(root)
     (d / "archive").mkdir(parents=True, exist_ok=True)
     # microsecond-precision stem so two writes in the same wall-clock second with the
@@ -302,12 +360,26 @@ def run_tests():
             "mismatched handoff must warn-only, never render the body"
 
     def t_read_path_shape_variants_match(tmp):
+        # What counts as a "shape variant" is platform-specific, and conflating
+        # the two would itself be a bug: on POSIX a backslash is a LEGAL
+        # FILENAME CHARACTER, so `\tmp\x` and `/tmp/x` are genuinely different
+        # paths and must NOT match. This case asserted the Windows spelling
+        # unconditionally and had no platform guard (unlike its 8.3 sibling
+        # below), so it was red on Linux from the day it was written — nobody
+        # saw it because the suite was not wired into CI until 2026-08-05.
+        # Both branches stay non-vacuous: each builds a DIFFERENT spelling of
+        # the same directory that normpath must fold back together.
         compose(tmp)
         latest = tmp / ".claude" / HANDOFF_DIR / LATEST
-        # rewrite project_path with backslashes + swapped drive case — MUST still match
-        variant = norm_path(tmp).replace("/", "\\")
-        if variant[:1].islower():
-            variant = variant[:1].upper() + variant[1:]
+        if os.name == "nt":
+            # backslash separators + swapped drive case
+            variant = norm_path(tmp).replace("/", "\\")
+            if variant[:1].islower():
+                variant = variant[:1].upper() + variant[1:]
+        else:
+            # redundant `.` segment + trailing separator
+            head, _, tail = norm_path(tmp).rpartition("/")
+            variant = f"{head}/./{tail}/"
         txt = re.sub(r"project_path: .*", lambda m: f"project_path: {variant}", latest.read_text(encoding="utf-8"))
         latest.write_text(txt, encoding="utf-8")
         out = read_for_orient(tmp)
@@ -384,22 +456,150 @@ def run_tests():
         seed(tmp)
         assert read_for_orient(tmp) is None, "no handoff must render nothing"
 
-    case("write: frontmatter + body + session-suffixed archive", t_write_basic)
-    case("write: empty body rejected", t_write_empty_body_rejected)
-    case("write: atomic, no temp litter, replace lands", t_write_no_partial_on_crash)
-    case("write: same-second same-sid writes keep both archive entries", t_write_same_second_same_sid_no_clobber)
-    case("write: gitignore guard appends and takes effect", t_gitignore_guard)
-    case("read: fresh handoff renders w/ boundary + preface", t_read_fresh_renders)
-    case("read: project mismatch warns, never renders body", t_read_project_mismatch)
-    case("read: Windows path-shape variants match", t_read_path_shape_variants_match)
-    case("read: 8.3 short-path spelling matches", t_read_short_path_variant_matches)
-    case("read: superseded by newer state", t_read_superseded_by_newer_state)
-    case("read: 5s tolerance window honored", t_read_tolerance_window)
-    case("read: malformed frontmatter -> one warn line", t_read_malformed_frontmatter)
-    case("read: truncation on line boundary + note", t_read_truncation_on_line_boundary)
-    case("read: body defanged, boundary un-escapable", t_read_defang)
-    case("read: strictly read-only", t_read_is_read_only)
-    case("read: absent -> None", t_read_absent)
+    # The suite above predates the fleet-steward P1 Task 3 claims-block
+    # embed and asserts on write_handoff's PRE-EMBED output shape (e.g.
+    # "body ends the file" / precise truncation-byte math on a read that
+    # itself calls write_handoff via compose()). Forcing the embed off
+    # for this whole block keeps every one of those assertions accurate
+    # regardless of whether checks/handoff_claims.py happens to be
+    # importable in THIS checkout (it is, in the toolkit dev repo — but
+    # the public plugin cut ships state-handoff WITHOUT checks/, which is
+    # exactly the scenario the dedicated embed cases below simulate).
+    _prev_claims_env = os.environ.get("STEWARD_HANDOFF_CLAIMS")
+    os.environ["STEWARD_HANDOFF_CLAIMS"] = "0"
+    try:
+        case("write: frontmatter + body + session-suffixed archive", t_write_basic)
+        case("write: empty body rejected", t_write_empty_body_rejected)
+        case("write: atomic, no temp litter, replace lands", t_write_no_partial_on_crash)
+        case("write: same-second same-sid writes keep both archive entries", t_write_same_second_same_sid_no_clobber)
+        case("write: gitignore guard appends and takes effect", t_gitignore_guard)
+        case("read: fresh handoff renders w/ boundary + preface", t_read_fresh_renders)
+        case("read: project mismatch warns, never renders body", t_read_project_mismatch)
+        case("read: Windows path-shape variants match", t_read_path_shape_variants_match)
+        case("read: 8.3 short-path spelling matches", t_read_short_path_variant_matches)
+        case("read: superseded by newer state", t_read_superseded_by_newer_state)
+        case("read: 5s tolerance window honored", t_read_tolerance_window)
+        case("read: malformed frontmatter -> one warn line", t_read_malformed_frontmatter)
+        case("read: truncation on line boundary + note", t_read_truncation_on_line_boundary)
+        case("read: body defanged, boundary un-escapable", t_read_defang)
+        case("read: strictly read-only", t_read_is_read_only)
+        case("read: absent -> None", t_read_absent)
+    finally:
+        if _prev_claims_env is None:
+            os.environ.pop("STEWARD_HANDOFF_CLAIMS", None)
+        else:
+            os.environ["STEWARD_HANDOFF_CLAIMS"] = _prev_claims_env
+
+    # --- fleet-steward P1 Task 3: the claims-block embed itself --------
+
+    def t_write_embeds_claims_block(tmp):
+        # Default (STEWARD_HANDOFF_CLAIMS unset) -> on. This checkout has
+        # checks/handoff_claims.py, so the embed must actually fire.
+        seed(tmp)
+        prev = os.environ.pop("STEWARD_HANDOFF_CLAIMS", None)
+        try:
+            write_handoff(tmp, "# Handoff\nbody line", "sess1")
+        finally:
+            if prev is not None:
+                os.environ["STEWARD_HANDOFF_CLAIMS"] = prev
+        latest = (tmp / ".claude" / HANDOFF_DIR / LATEST).read_text(encoding="utf-8")
+        assert "body line" in latest, "original body must still be present"
+        assert "steward:" in latest or "claims: unverified" in latest, \
+            "claims block missing from a default (steward-available) write"
+
+    def t_write_claims_opt_out(tmp):
+        seed(tmp)
+        prev = os.environ.get("STEWARD_HANDOFF_CLAIMS")
+        os.environ["STEWARD_HANDOFF_CLAIMS"] = "0"
+        try:
+            write_handoff(tmp, "# Handoff\nbody line", "sess1")
+        finally:
+            if prev is None:
+                os.environ.pop("STEWARD_HANDOFF_CLAIMS", None)
+            else:
+                os.environ["STEWARD_HANDOFF_CLAIMS"] = prev
+        latest = (tmp / ".claude" / HANDOFF_DIR / LATEST).read_text(encoding="utf-8")
+        assert latest.rstrip().endswith("body line"), \
+            "STEWARD_HANDOFF_CLAIMS=0 must leave output byte-identical to pre-embed behavior"
+        assert "steward:" not in latest and "claims: unverified" not in latest, \
+            "STEWARD_HANDOFF_CLAIMS=0 must fully suppress the claims block"
+
+    def t_write_embed_absent_noop(tmp):
+        # Simulate the PUBLIC PLUGIN CUT (checks/ + bin/_steward.py absent)
+        # via an import-failure stand-in, without touching this checkout's
+        # real checks/ dir on disk (see task report for the additional
+        # manual rename-based confirmation of the same property).
+        seed(tmp)
+        global _load_handoff_claims
+        orig_loader = _load_handoff_claims
+        _load_handoff_claims = lambda: None
+        prev = os.environ.pop("STEWARD_HANDOFF_CLAIMS", None)
+        try:
+            write_handoff(tmp, "# Handoff\nbody line", "sess1")
+        finally:
+            _load_handoff_claims = orig_loader
+            if prev is not None:
+                os.environ["STEWARD_HANDOFF_CLAIMS"] = prev
+        latest = (tmp / ".claude" / HANDOFF_DIR / LATEST).read_text(encoding="utf-8")
+        assert latest.rstrip().endswith("body line"), \
+            "public-cut simulation (import unavailable) must be byte-identical to pre-embed output"
+        assert "steward:" not in latest and "claims: unverified" not in latest, \
+            "public-cut simulation must not emit a claims block"
+
+    def t_write_embed_nonimport_error_noop(tmp):
+        # Post-review fix: a NON-ImportError failure while importing
+        # checks/handoff_claims.py (or a transitive sibling) -- e.g. an
+        # AttributeError from version skew, or any other bug in the
+        # module body -- must ALSO degrade to the byte-identical
+        # pre-embed write, not crash it. _load_handoff_claims()'s
+        # `except ImportError` alone would miss this, since the module
+        # body of handoff_claims.py runs INSIDE that try block, as part
+        # of the `import` statement itself.
+        #
+        # Reproduced with a REAL import-time failure (not a monkeypatch
+        # of the loader function itself, which would only prove the call
+        # site is guarded, not that the broadened except clause works):
+        # a throwaway fixture checks/ dir whose handoff_claims.py raises
+        # AttributeError at module scope, shadowing the real module by
+        # putting the fixture dir first on sys.path and evicting the
+        # real modules from sys.modules for the duration of this case.
+        seed(tmp)
+        fixture_dir = Path(tempfile.mkdtemp(prefix="hc-fixture-"))
+        (fixture_dir / "handoff_claims.py").write_text(
+            "raise AttributeError('simulated version-skew import failure')\n",
+            encoding="utf-8")
+        mod_names = ("handoff_claims", "unpushed_work", "ci_status",
+                     "version_divergence", "_steward")
+        saved_modules = {n: sys.modules.pop(n) for n in mod_names
+                         if n in sys.modules}
+        saved_path = list(sys.path)
+        sys.path.insert(0, str(fixture_dir))
+        prev = os.environ.pop("STEWARD_HANDOFF_CLAIMS", None)
+        try:
+            write_handoff(tmp, "# Handoff\nbody line", "sess1")
+        finally:
+            sys.path[:] = saved_path
+            for n in mod_names:
+                sys.modules.pop(n, None)
+            sys.modules.update(saved_modules)
+            if prev is not None:
+                os.environ["STEWARD_HANDOFF_CLAIMS"] = prev
+            shutil.rmtree(fixture_dir, ignore_errors=True)
+        latest = (tmp / ".claude" / HANDOFF_DIR / LATEST).read_text(encoding="utf-8")
+        assert latest.rstrip().endswith("body line"), \
+            "a non-ImportError import-time failure must be byte-identical to pre-embed output"
+        assert "steward:" not in latest and "claims: unverified" not in latest, \
+            "a non-ImportError import-time failure must not emit a claims block"
+
+    case("write: embeds a sanitized claims block by default when the "
+         "steward bits are importable", t_write_embeds_claims_block)
+    case("write: STEWARD_HANDOFF_CLAIMS=0 fully suppresses the embed "
+         "(byte-identical to pre-embed output)", t_write_claims_opt_out)
+    case("write: import failure (public-cut simulation) is a silent "
+         "no-op, byte-identical to pre-embed output", t_write_embed_absent_noop)
+    case("write: a non-ImportError import-time failure (version skew / "
+         "a bug in the module body) is also a silent no-op, byte-identical "
+         "to pre-embed output", t_write_embed_nonimport_error_noop)
 
     print(f"state-handoff --test: {len(fails)} failed")
     return 1 if fails else 0

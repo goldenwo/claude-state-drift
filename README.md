@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.4.1-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.4.2-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/runs%20in-Claude%20Code%20%C2%B7%20Copilot%20CLI%20%C2%B7%20Codex%20CLI-8A63D2" alt="runs in Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
@@ -185,12 +185,12 @@ bloat. It isn't — and almost all of the cost is paid once, at session start:
 
 | Injection | When | Typical size |
 |---|---|---|
-| Orientation block | once, at session start | ~700–2,000 tokens |
+| Orientation block | once, at session start | ~550–2,800 tokens |
 | Focus re-injection | every 6th prompt (tunable) | ~180 tokens |
 | Handoff embed (only when one is parked and still fresh) | once, at session start | body capped at 6 KB |
 | Handoff nudge (only at high context use) | at most once per session | one line |
 
-For a typical long session that's roughly **1,000–4,000 tokens total — under 1–2%
+For a typical long session that's roughly **1,000–4,500 tokens total — about 1–2%
 of a 200K window** — and most of it is the one-time orientation block, which
 prompt-caches with the rest of your session prefix. The only recurring cost, the
 focus re-injection, is smaller than a single file read.
@@ -208,6 +208,11 @@ Tune or disable the per-prompt focus check per project in `.claude/hooks-config.
 your machine. For scale, that per-session cost is in the same range as a lean
 project `CLAUDE.md`, and a small fraction of what one MCP server's tool
 definitions cost you on every turn.
+
+`CLAUDE_HOOK_CAPTURE=1` (off by default) writes each hook's raw input payload
+to `.claude/.hook-captures/` in the current project — useful when regenerating
+payload fixtures. Captures are written locally only, the directory self-ignores
+in git, and nothing leaves your machine.
 
 (Token counts measured with a GPT-family tokenizer as a proxy; Claude's own
 tokenizer differs by ~±15%. Numbers are for typical projects — a verbose
@@ -232,6 +237,34 @@ timeline
 ```
 
 That's heavy real-world use — a dogfooding record, not a controlled efficacy claim.
+
+### Nine weeks of receipts
+
+Operational numbers from the author's own machine — every repo with the opt-in
+`CLAUDE_HOOK_LOG=1` telemetry enabled, 2026-06-12 → 2026-08-16 (~9 weeks,
+8 repos), computed by the same local pipeline behind `where-am-i --stats`:
+
+| Measured | Value |
+|---|---|
+| Sessions opened with an orientation block | 458 |
+| Orientation blocks injected | 836 |
+| Focus re-injections | 428 |
+| Update nudges fired (commit + staleness) | 29 |
+| Orientation cost — median, per repo | ~550–2,800 tokens |
+| Focus re-injection cost — median | ~190 tokens |
+
+Two honest footnotes:
+
+- Token numbers are the tool's own estimate (injected bytes ÷ 3.8, within
+  ~±15% of a tokenizer count).
+- One of the eight repos let `current_focus` grow into a ~9,000-token
+  orientation block — the documented failure mode from the cost section above.
+  The fix is editorial, not configuration: keep that field to a sentence.
+
+These are activity and cost receipts — what fired and what it cost. Deliberately
+absent: any "drift prevented" or nudge-conversion number. A conversion rate
+exists in `--stats`, but at ~30 fleet-wide nudge events it is noise, not signal
+— and no activity telemetry can observe the counterfactual anyway.
 
 ## The `state.json` model
 

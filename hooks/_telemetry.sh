@@ -27,6 +27,16 @@
 #     CLAUDE_HOOK_LOG=1                — enable (default: disabled, no-op)
 #     CLAUDE_HOOK_LOG_MAX_BYTES=N      — size cap (default: 10485760 = 10MB)
 #
+# Sources _tmpdir.sh, and is the SINGLE owner of that load — every hook that
+# sources THIS file (8 of the 16; see _tmpdir.sh's header for the list and for
+# what the other 8 must do) gets `harness_tmp` in scope and must not source it
+# again (an earlier revision had four hooks doing so redundantly). It has to
+# happen HERE at top level rather than lazily inside the size-cap branch that
+# needs it: telem_end runs from an EXIT trap, which fires AFTER any cd the
+# consuming hook performed, so a source resolved at that point would break for
+# any invocation whose $0 is a relative path. Function-only helper — sourcing
+# forks nothing, so the hooks' zero-subprocess fast paths are unaffected.
+#
 # Size cap: when the log file size ≥ MAX_BYTES, the hook refuses further
 # writes for this session and emits a one-shot stderr warning (marker
 # file pattern, same as focus-check counter-write-failure). Kill switch
@@ -35,6 +45,16 @@
 # Portability: uses `date +%s%N` (GNU date / git-bash). On BSD date
 # (macOS, FreeBSD) %N is literal — we detect this once and fall back
 # to seconds × 1000 (sub-second precision lost but log shape preserved).
+
+# $(dirname …), NOT ${BASH_SOURCE[0]%/*}: the latter strips nothing when the
+# path carries no slash, so `cd hooks && source _telemetry.sh` would source
+# "_telemetry.sh/_tmpdir.sh", fail, and leave harness_tmp UNDEFINED — after
+# which telem_end's warn branch would touch "/.claude-hook-log-warned-$$" at
+# the filesystem root. dirname always emits at least ".". The round-1 reviewer
+# caught this shape in focus-check.sh; round 2 caught that the fix had
+# relocated the fragile idiom here rather than replacing it. T-TD1 locks it.
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/_tmpdir.sh"
 
 # Detect nanosecond support once per source.
 if [ -z "${_TEL_NS_OK:-}" ]; then
@@ -66,6 +86,33 @@ _telem_now_ms() {
 # sanitizer-output-survives-the-whitelist contract against the real telem_end.
 telem_safe_sid() {
     SAFE_SID="${1//[^A-Za-z0-9_-]/}"
+}
+
+# telemetry_capture <hook-name> <payload> <cwd> — opt-in raw-payload capture
+# (spec §2.3). Called by each hook AFTER its own INPUT="$(cat)" read — NEVER
+# a source-time stdin tee (that would consume stdin and no-op the hook).
+# Best-effort: a full disk or unwritable .claude must never affect emission.
+telemetry_capture() {
+    [ "${CLAUDE_HOOK_CAPTURE:-0}" = "1" ] || return 0
+    local hook="$1" payload="$2" cwd="${3:-$PWD}" dir ts
+    dir="${cwd}/.claude/.hook-captures"
+    [ -d "${cwd}/.claude" ] || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # self-ignoring dir (house pattern, cf. focus-check.sh handoff sentinel):
+    # CSD consumer repos get mechanical containment, not just a README note.
+    printf '*\n' > "$dir/.gitignore" 2>/dev/null || true
+    # Unique filename suffix: reuse _telem_now_ms's BSD-safe date probe
+    # (review follow-up C5) instead of a bare `date +%s%N 2>/dev/null ||
+    # date +%s`. On BSD/macOS date, `%N` is a LITERAL, unexpanded 'N' rather
+    # than an error, so that idiom's `||` never fires and two captures from
+    # the same hook in the same second silently overwrite each other.
+    # _telem_now_ms already solves this correctly via the _TEL_NS_OK probe
+    # above; guarded the same way telem_start guards it, so an unexpected
+    # failure degrades to an empty (still-valid, just less unique) suffix
+    # instead of aborting the capture.
+    ts=$(_telem_now_ms 2>/dev/null) || ts=""
+    printf '%s' "$payload" > "$dir/${hook}-${ts}.json" 2>/dev/null || true
+    return 0
 }
 
 telem_start() {
@@ -102,7 +149,8 @@ telem_end() {
         size="${size// /}"
         size="${size//$'\t'/}"
         if [ "$size" -ge "$max_bytes" ] 2>/dev/null; then
-            warn_marker="${TMPDIR:-/tmp}/.claude-hook-log-warned-$$"
+            harness_tmp
+            warn_marker="${HARNESS_TMP:-${TMPDIR:-/tmp}}/.claude-hook-log-warned-$$"
             if [ ! -f "$warn_marker" ]; then
                 echo "WARN: ${log_file} (${size} bytes) >= cap ${max_bytes}; refusing telemetry writes this session. Set CLAUDE_HOOK_LOG=0 to disable, or truncate/rotate the file." >&2
                 touch "$warn_marker" 2>/dev/null || true
@@ -158,6 +206,16 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ] && [ "${1:-}" = "--test" ]; then
 
     echo "=== _telemetry.sh self-test ==="
 
+    # T-TD1: this file is the SOLE owner of the _tmpdir.sh load for the whole
+    # hook set — every consumer relies on harness_tmp being in scope purely as
+    # a side effect of sourcing this one. A broken source here is silent (the
+    # rest of the file still works; only telem_end's rare warn branch degrades,
+    # writing its marker to the filesystem root), so assert the load actually
+    # landed. Round 2 found exactly this failing under a slashless path.
+    [ "$(type -t harness_tmp 2>/dev/null)" = "function" ] \
+        && _tt_ok "T-TD1 sourcing this helper defines harness_tmp" \
+        || _tt_bad "T-TD1 harness_tmp NOT defined — the _tmpdir.sh source failed silently"
+
     # T1: clean UUID-style sid passes through unchanged
     telem_safe_sid "7200a7e9-6a33-4133-94cf-9d4621482656"
     [ "$SAFE_SID" = "7200a7e9-6a33-4133-94cf-9d4621482656" ] \
@@ -191,6 +249,23 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ] && [ "${1:-}" = "--test" ]; then
     grep -q '"session":"sidwithbadcharsandspaces"' "$_tt_tmp/.claude/.hook-log.jsonl" 2>/dev/null \
         && _tt_ok "T4 sanitized sid survives the real telem_end whitelist" \
         || _tt_bad "T4 sanitized sid survives the real telem_end whitelist"
+    rm -rf "$_tt_tmp"
+
+    # T5: capture disabled (default) → no file, no dir
+    _tt_tmp=$(mktemp -d); mkdir -p "$_tt_tmp/.claude"
+    telemetry_capture test-hook.sh '{"k":"v"}' "$_tt_tmp"
+    [ ! -d "$_tt_tmp/.claude/.hook-captures" ] \
+        && _tt_ok "T5 capture no-op when unset" || _tt_bad "T5 capture no-op when unset"
+    rm -rf "$_tt_tmp"
+
+    # T6: capture enabled → payload file written verbatim + self-ignoring .gitignore
+    _tt_tmp=$(mktemp -d); mkdir -p "$_tt_tmp/.claude"
+    ( CLAUDE_HOOK_CAPTURE=1 telemetry_capture test-hook.sh '{"k":"v"}' "$_tt_tmp" )
+    _tt_cap=$(ls "$_tt_tmp/.claude/.hook-captures/"test-hook.sh-*.json 2>/dev/null | head -1)
+    [ -n "$_tt_cap" ] && grep -q '"k":"v"' "$_tt_cap" \
+        && grep -qx '\*' "$_tt_tmp/.claude/.hook-captures/.gitignore" 2>/dev/null \
+        && _tt_ok "T6 capture writes payload + self-ignoring gitignore" \
+        || _tt_bad "T6 capture writes payload + self-ignoring gitignore"
     rm -rf "$_tt_tmp"
 
     echo "_telemetry.sh self-test: $_tt_pass passed, $_tt_fail failed"

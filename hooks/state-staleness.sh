@@ -41,6 +41,11 @@ command -v git >/dev/null 2>&1 || exit 0
 # _python.sh helper (py = the Windows fallback when python3/python are Store stubs).
 # shellcheck disable=SC1091
 source "$(dirname "$0")/_python.sh"
+
+# _telemetry.sh also loads hooks/_tmpdir.sh, so harness_tmp is in scope from
+# here on. That matters for WHERE it is loaded: this hook `cd`s into the
+# project below, and telem_end runs from an EXIT trap afterwards, so any
+# helper source resolved post-cd would break for a relative $0.
 ensure_python || exit 0
 PYTHON="$PYTHON_BIN"
 
@@ -50,20 +55,54 @@ INPUT="$(cat 2>/dev/null)"
 CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
 [ -z "$CWD" ] && CWD="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 
+telemetry_capture state-staleness.sh "$INPUT" "$CWD"
+
 STATE_FILE="$CWD/.claude/state.json"
 [ -f "$STATE_FILE" ] || exit 0
 [ -d "$CWD/.git" ] || exit 0
 
+# Guard-skip breadcrumb (spec §3.2, Task 10 / cff15ee follow-up 2): when the
+# #78 out-of-root guard below silent-skips, emit a ONE-TIME-PER-SESSION
+# stderr breadcrumb (deduped via a marker file) plus a "guard_skip":1
+# telemetry enrichment — the silent-skip is no longer invisible to a human
+# debugging the harness, nor to --stats analysis. Self-contained: re-parses
+# session_id from $INPUT directly rather than relying on either hook's own
+# SESSION_ID variable (state-staleness.sh computes SESSION_ID only AFTER this
+# guard runs — see below). Kept BYTE-IDENTICAL between state-staleness.sh and
+# state-track-commit.sh (paired copies) — edit one, edit both.
+_guard_skip() {  # $1 hook-name (uses $CWD, $CLAUDE_PROJECT_DIR, $INPUT globals)
+    local sid; sid=$(printf '%s' "$INPUT" | jq -r '.session_id // .sessionId // ""' 2>/dev/null)
+    sid="${sid//[^A-Za-z0-9_-]/}"
+    harness_tmp
+    local marker="${HARNESS_TMP:-${TMPDIR:-/tmp}}/.claude-guardskip-$1-${sid:-nosid}"
+    if [ ! -f "$marker" ]; then
+        echo "[$1] cwd-guard skip: cwd=${CWD} root=${CLAUDE_PROJECT_DIR}" >&2
+        touch "$marker" 2>/dev/null
+    fi
+    TELEM_EXTRA='"guard_skip":1'
+    exit 0
+}
+
 # #78 (R4 N3) untrusted-CWD validation — defense-in-depth. If a trusted root is
 # known ($CLAUDE_PROJECT_DIR set), refuse to chdir into a $CWD that escapes it.
-# Compare with separators NORMALIZED (\ → /): Windows payloads carry backslash
-# .cwd vs forward-slash $CLAUDE_PROJECT_DIR — the raw compare silent-skipped
-# every real fire (T146d regression-lock; see state-track-commit.sh #78 note).
+# Separator normalization (\ → /) + case-fold apply ONLY under msys/cygwin
+# (Windows payloads carry backslash .cwd vs forward-slash $CLAUDE_PROJECT_DIR;
+# the raw compare silent-skipped every real fire — T146d regression-lock; see
+# state-track-commit.sh #78 note). On POSIX the compare is RAW (cff15ee
+# follow-up 3, spec §3.3): \ is a legal, literal filename byte there, so
+# normalizing unconditionally would fold a directory literally named
+# `proj\evil` into `proj/evil` and let it slip past the trusted-root prefix
+# check below.
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
-    CWD_CMP="${CWD//\\//}"; ROOT_CMP="${CLAUDE_PROJECT_DIR//\\//}"
+    case "$OSTYPE" in
+        msys*|cygwin*)
+            CWD_CMP="${CWD//\\//}"; ROOT_CMP="${CLAUDE_PROJECT_DIR//\\//}"
+            CWD_CMP="${CWD_CMP,,}"; ROOT_CMP="${ROOT_CMP,,}" ;;  # NTFS is case-insensitive (spec §3.1)
+        *)  CWD_CMP="$CWD"; ROOT_CMP="$CLAUDE_PROJECT_DIR" ;;  # POSIX: raw, case-sensitive, no separator folding
+    esac
     case "${CWD_CMP%/}" in
         "${ROOT_CMP%/}"|"${ROOT_CMP%/}"/*) ;;  # in-root → proceed
-        *) exit 0 ;;                           # escapes trusted root → silent-skip
+        *) _guard_skip "state-staleness.sh" ;;  # escapes trusted root → deduped stderr breadcrumb + guard_skip telemetry
     esac
 fi
 
@@ -71,9 +110,15 @@ cd "$CWD" 2>/dev/null || exit 0
 
 # Per-session dedup — shared across BOTH nudges (one emit per session total).
 SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // .sessionId // ""' 2>/dev/null)
+# Resolve the scoped temp dir UNCONDITIONALLY here, not inside the SESSION_ID
+# guard below: the parsefail WARN_FILE in _compute_stale also needs
+# HARNESS_TMP and is reachable with an empty SESSION_ID, which would
+# otherwise leave it writing to "/.claude-state-staleness-parsefail-$$".
+harness_tmp
+
 NUDGE_FILE=""
 if [ -n "$SESSION_ID" ]; then
-    NUDGE_FILE="${TMPDIR:-/tmp}/.claude-state-staleness-${SESSION_ID}"
+    NUDGE_FILE="${HARNESS_TMP:-${TMPDIR:-/tmp}}/.claude-state-staleness-${SESSION_ID}"
     [ -f "$NUDGE_FILE" ] && exit 0
 fi
 
@@ -83,36 +128,40 @@ fi
 # bloat half below would be lost. ---
 STALE_BLOCK=""; STALE_LAG=""; STALE_COMMITS=""
 _compute_stale() {
-    local LAST_UPDATED HEAD_TIME HOURS_THRESHOLD COMMITS_THRESHOLD LAG_HOURS COMMITS_AHEAD STATE_LIB WARN_FILE
+    local LAST_UPDATED HEAD_TIME HOURS_THRESHOLD COMMITS_THRESHOLD STATE_LIB WARN_FILE RESULT LAG_HOURS COMMITS_AHEAD IS_STALE
     LAST_UPDATED=$(jq -r '.last_updated // ""' "$STATE_FILE" 2>/dev/null)
     [ -z "$LAST_UPDATED" ] && return 0
     HEAD_TIME=$(git log -1 --format=%aI HEAD 2>/dev/null)
     [ -z "$HEAD_TIME" ] && return 0
     HOURS_THRESHOLD="${STATE_STALENESS_HOURS:-24}"
     COMMITS_THRESHOLD="${STATE_STALENESS_COMMITS:-3}"
-    # Hours between state.last_updated and HEAD. Timestamps pass via env vars
-    # (LU + HT) — never shell interpolation — so a tampered state.json can't
-    # become Python injection (T47 regression-guards this).
+    # fleet-steward P2 Task 8 (survey cluster 4): the two-clause predicate
+    # itself — lag-hours AND commits-since, plus the Phase P F6
+    # unparseable-`--since` guard — now lives in exactly ONE place,
+    # bin/_state_lib.evaluate_staleness(). This hook resolves its own
+    # thresholds (above, unchanged) and passes EVERYTHING by env var —
+    # LU/HT/REPO/HOURS_T/COMMITS_T — never shell/argv interpolation, so a
+    # tampered state.json can't become Python injection (T47
+    # regression-guards this; the CLI's own --staleness branch never reads
+    # argv values either).
     STATE_LIB="$(dirname "$0")/../bin/_state_lib.py"
-    LAG_HOURS=$(LU="$LAST_UPDATED" HT="$HEAD_TIME" "$PYTHON" "$STATE_LIB" --lag-hours 2>/dev/null)
+    RESULT=$(LU="$LAST_UPDATED" HT="$HEAD_TIME" REPO="$CWD" \
+             HOURS_T="$HOURS_THRESHOLD" COMMITS_T="$COMMITS_THRESHOLD" \
+             "$PYTHON" "$STATE_LIB" --staleness 2>/dev/null)
+    LAG_HOURS=$(printf '%s' "$RESULT" | awk '{print $1}')
+    COMMITS_AHEAD=$(printf '%s' "$RESULT" | awk '{print $2}')
+    IS_STALE=$(printf '%s' "$RESULT" | awk '{print $3}')
     [ -z "$LAG_HOURS" ] && LAG_HOURS="-"
     if [ "$LAG_HOURS" = "-" ]; then
-        WARN_FILE="${TMPDIR:-/tmp}/.claude-state-staleness-parsefail-${SESSION_ID:-$$}"
+        WARN_FILE="${HARNESS_TMP:-${TMPDIR:-/tmp}}/.claude-state-staleness-parsefail-${SESSION_ID:-$$}"
         if [ ! -f "$WARN_FILE" ]; then
             echo "WARN: state-staleness could not parse last_updated='${LAST_UPDATED}' or HEAD time='${HEAD_TIME}'. Staleness check skipped this session." >&2
             touch "$WARN_FILE" 2>/dev/null
         fi
         return 0
     fi
-    # Only pass --since when LAG_HOURS>0 (parse succeeded), else git log --since
-    # with an unparseable value returns ALL commits → false-trip (Phase P F6).
-    if [ "$LAG_HOURS" -gt 0 ] 2>/dev/null; then
-        COMMITS_AHEAD=$(git log --since="$LAST_UPDATED" --oneline 2>/dev/null | wc -l | tr -d ' ')
-    else
-        COMMITS_AHEAD=0
-    fi
     [ -z "$COMMITS_AHEAD" ] && COMMITS_AHEAD=0
-    [ "$LAG_HOURS" -lt "$HOURS_THRESHOLD" ] || [ "$COMMITS_AHEAD" -lt "$COMMITS_THRESHOLD" ] && return 0
+    [ "$IS_STALE" = "1" ] || return 0
     STALE_BLOCK=$(printf '<state-staleness>\n.claude/state.json is stale:\n  last_updated: %s\n  HEAD commit:  %s (%dh newer than state)\n  Commits since state update: %d\n\nThe state.json does not reflect recent activity. Before declaring the task done, consider invoking the `update-state` skill to catch up. Configurable via STATE_STALENESS_HOURS (default 24) and STATE_STALENESS_COMMITS (default 3); disable via STATE_STALENESS_DISABLE=1.\n</state-staleness>' \
         "$LAST_UPDATED" "$HEAD_TIME" "$LAG_HOURS" "$COMMITS_AHEAD")
     STALE_LAG="$LAG_HOURS"; STALE_COMMITS="$COMMITS_AHEAD"

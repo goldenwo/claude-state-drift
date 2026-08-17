@@ -136,6 +136,8 @@ fi
 [ -z "${INPUT}" ] && INPUT="$(cat 2>/dev/null)"
 [ -z "${INPUT}" ] && exit 0
 
+telemetry_capture focus-check.sh "$INPUT" "$CWD"
+
 # Single jq spawn pulls both session_id and transcript_path (the latter
 # needed only by the handoff-pressure nudge's token-estimate fallback
 # below) — avoids a second subprocess in the common no-pressure hot path.
@@ -205,7 +207,27 @@ if [ "${STATE_HANDOFF_NUDGE_DISABLE:-0}" != "1" ]; then
     fi
 fi
 
-TMP="${TMPDIR:-/tmp}"
+# Scoped temp dir. These per-session counters used to land in the SHARED
+# system temp root, which is what made session-start-orient.sh's stale-tracker
+# sweep O(everything any program on the box ever left there). harness_tmp
+# comes from hooks/_tmpdir.sh, which _telemetry.sh (sourced at line 36, before
+# every early exit) loads for its own warn-marker path — so there is no second
+# source here. An earlier revision added one and the round-1 reviewer caught it
+# as dead work whose ${BASH_SOURCE[0]%/*} form also printed
+# "focus-check.sh/_tmpdir.sh: Not a directory" on every fire whenever argv0
+# carried no slash. Cost, measured rather than asserted: sourcing forks
+# nothing, but harness_tmp is NOT free on POSIX — its mode check spends one
+# stat fork per call (~1.1ms measured on ubuntu:24.04, vs ~8us for the
+# builtin-only tests) and two on macOS, where the GNU probe must fail first.
+# Zero forks on Windows, which returns before the stat. Negligible against
+# this hook's 600ms budget, but it is real: do not add more work here on the
+# assumption that this path is fork-free.
+harness_tmp
+# Guarded, not decorative: harness_tmp only exists for the 8 hooks that source
+# _telemetry.sh, and a bare "$HARNESS_TMP" in a hook that ever stops doing so
+# would put this counter at the filesystem root. See _tmpdir.sh's header; T-S12
+# pins the form across all of hooks/.
+TMP="${HARNESS_TMP:-${TMPDIR:-/tmp}}"
 COUNTER_FILE="${TMP}/.claude-focus-check-${SESSION_ID}"
 
 COUNTER=0
@@ -239,7 +261,7 @@ if ! { printf '%d\n' "${COUNTER}" > "${TMP_COUNTER}" 2>/dev/null && mv "${TMP_CO
     WARN_MARKER="${TMP}/.claude-focus-check-warned-${SESSION_ID}"
     if [ ! -f "$WARN_MARKER" ]; then
         TMP_INFO=$(ls -ld "$TMP" 2>&1 | head -1)
-        echo "WARN: focus-check.sh cannot persist counter to ${COUNTER_FILE} — focus-check will not fire correctly. TMPDIR=${TMP}; perms: ${TMP_INFO}" >&2
+        echo "WARN: focus-check.sh cannot persist counter to ${COUNTER_FILE} — focus-check will not fire correctly. dir=${TMP} (TMPDIR=${TMPDIR:-/tmp}); perms: ${TMP_INFO}" >&2
         touch "$WARN_MARKER" 2>/dev/null
     fi
 fi
@@ -248,17 +270,42 @@ if [ $((COUNTER % EVERY)) -ne 0 ]; then
     exit 0
 fi
 
-OBJECTIVE=$(jq -r '.objective // ""' "${STATE_FILE}" 2>/dev/null)
-# Phase O #66 (baseline F15): truncate to 300 *codepoints* + ellipsis
-# INSIDE the jq read. Bash `${FOCUS:0:300}` is byte-indexed under a byte
-# locale (LC_ALL=C) and splits a multibyte char mid-sequence → the
-# downstream `jq -n --arg` then either errors (no block emitted) or
-# launders the broken bytes into valid-but-wrong mojibake. jq `length`
-# and `[a:b]` are Unicode-codepoint-based and locale-independent, so this
-# is correct on every platform with zero extra processes (reuses this jq
-# spawn). `tostring` keeps a non-string current_focus from erroring.
-FOCUS=$(jq -r '(.current_focus // "" | tostring | if length > 300 then .[0:300] + "…" else . end)' "${STATE_FILE}" 2>/dev/null)
-VERSION=$(jq -r '.version // "?"' "${STATE_FILE}" 2>/dev/null)
+# SINGLE-PASS state.json read. This was three separate `jq` spawns over the
+# same file; measured on Windows at ~109ms each, they were the dominant term
+# in this hook's p95adj (775ms against a 600ms budget — perf-bench [OVER]).
+# Process COUNT, not parse size, is what costs: one spawn now emits all three
+# values, newline-separated.
+#
+# Phase O #66 (baseline F15): truncate to 300 *codepoints* + ellipsis INSIDE
+# the jq read. Bash `${FOCUS:0:300}` is byte-indexed under a byte locale
+# (LC_ALL=C) and splits a multibyte char mid-sequence → the downstream
+# `jq -n --arg` then either errors (no block emitted) or launders the broken
+# bytes into valid-but-wrong mojibake. jq `length` and `[a:b]` are
+# Unicode-codepoint-based and locale-independent, so this is correct on every
+# platform. `tostring` keeps a non-string current_focus from erroring.
+#
+# Phase O #70's CR/LF flattening also moves in here, replacing two downstream
+# `tr` spawns. It MUST happen inside jq now: the three values are split back
+# apart line-by-line, so an embedded newline would desynchronise the split.
+# `gsub("[\r\n]+"; " ")` is the same translate-and-squeeze as `tr -s '\r\n' ' '`.
+_FC_RAW=$(jq -r '
+    def flat: tostring | gsub("[\r\n]+"; " ");
+    (.objective // "" | flat),
+    (.current_focus // "" | tostring
+        | if length > 300 then .[0:300] + "…" else . end
+        | flat),
+    (.version // "?" | flat)
+' "${STATE_FILE}" 2>/dev/null)
+OBJECTIVE=${_FC_RAW%%$'\n'*}
+_FC_REST=${_FC_RAW#*$'\n'}
+FOCUS=${_FC_REST%%$'\n'*}
+VERSION=${_FC_REST#*$'\n'}
+# jq -r leaks msys2 CRLF line endings on git-bash (handoff learning #5). The
+# old `tr -s '\r\n' ' '` swallowed those terminators as a side effect; the
+# line-split above does not, so strip the trailing CR explicitly.
+OBJECTIVE=${OBJECTIVE%$'\r'}
+FOCUS=${FOCUS%$'\r'}
+VERSION=${VERSION%$'\r'}
 
 [ -z "${OBJECTIVE}" ] && [ -z "${FOCUS}" ] && exit 0
 
@@ -280,13 +327,10 @@ SAFE_FOCUS="${FOCUS_SHORT//</‹}"; SAFE_FOCUS="${SAFE_FOCUS//>/›}"
 # Phase M #64 neutralized <>-markup, but a poisoned objective/current_focus
 # can still carry a `\n\nSYSTEM: ignore previous` block whose blank-line
 # separator reads as a fresh instruction section. These are single-line
-# metadata fields — newlines in them carry no legitimate meaning — so
-# flatten any CR/LF run to one space (tr maps \r and \n to space, -s
-# squeezes the run). This also strips the msys2 CRLF that jq -r leaks on
-# git-bash (handoff learning #5). Defanged, not deleted, consistent with
-# the <> treatment above. Single tr keeps the emit path cheap (perf gate).
-SAFE_OBJECTIVE=$(printf '%s' "$SAFE_OBJECTIVE" | tr -s '\r\n' ' ')
-SAFE_FOCUS=$(printf '%s' "$SAFE_FOCUS" | tr -s '\r\n' ' ')
+# metadata fields — newlines in them carry no legitimate meaning — so any
+# CR/LF run is flattened to one space. That now happens inside the single
+# jq read above (see there), which removes the two `tr` spawns this step
+# used to cost. Defanged, not deleted, consistent with the <> treatment.
 
 BLOCK=$(printf '<focus-check>\nObjective: %s\nCurrent focus: %s\nProject version: %s\nYou are %d turns into this session. Verify your next action serves the focus before proceeding. If it does not, reconsider scope or invoke the re-anchor skill (or /re-anchor).\n</focus-check>' \
     "${SAFE_OBJECTIVE}" "${SAFE_FOCUS}" "${VERSION}" "${COUNTER}")

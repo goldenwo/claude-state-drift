@@ -30,6 +30,10 @@ set +e
 # F-prep.3 telemetry — sourced before any early-exit.
 # shellcheck disable=SC1091
 source "$(dirname "$0")/_telemetry.sh"
+# _telemetry.sh also loads hooks/_tmpdir.sh, so harness_tmp is in scope from
+# here on. That matters for WHERE it is loaded: this hook `cd`s into the
+# project below, and telem_end runs from an EXIT trap afterwards, so any
+# helper source resolved post-cd would break for a relative $0.
 telem_start
 trap 'telem_end state-track-commit.sh "${TELEM_EMIT:-0}" "${CWD:-$PWD}"' EXIT
 
@@ -98,9 +102,33 @@ esac
 
 [ -z "$CWD" ] && CWD="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 
+telemetry_capture state-track-commit.sh "$INPUT" "$CWD"
+
 STATE_FILE="$CWD/.claude/state.json"
 [ -f "$STATE_FILE" ] || exit 0
 [ -d "$CWD/.git" ] || exit 0
+
+# Guard-skip breadcrumb (spec §3.2, Task 10 / cff15ee follow-up 2): when the
+# #78 out-of-root guard below silent-skips, emit a ONE-TIME-PER-SESSION
+# stderr breadcrumb (deduped via a marker file) plus a "guard_skip":1
+# telemetry enrichment — the silent-skip is no longer invisible to a human
+# debugging the harness, nor to --stats analysis. Self-contained: re-parses
+# session_id from $INPUT directly rather than relying on either hook's own
+# SESSION_ID variable (state-staleness.sh computes SESSION_ID only AFTER this
+# guard runs — see below). Kept BYTE-IDENTICAL between state-staleness.sh and
+# state-track-commit.sh (paired copies) — edit one, edit both.
+_guard_skip() {  # $1 hook-name (uses $CWD, $CLAUDE_PROJECT_DIR, $INPUT globals)
+    local sid; sid=$(printf '%s' "$INPUT" | jq -r '.session_id // .sessionId // ""' 2>/dev/null)
+    sid="${sid//[^A-Za-z0-9_-]/}"
+    harness_tmp
+    local marker="${HARNESS_TMP:-${TMPDIR:-/tmp}}/.claude-guardskip-$1-${sid:-nosid}"
+    if [ ! -f "$marker" ]; then
+        echo "[$1] cwd-guard skip: cwd=${CWD} root=${CLAUDE_PROJECT_DIR}" >&2
+        touch "$marker" 2>/dev/null
+    fi
+    TELEM_EXTRA='"guard_skip":1'
+    exit 0
+}
 
 # #78 (R4 N3) untrusted-CWD validation — defense-in-depth, NOT a live
 # vuln (Claude Code supplies $CWD; not adversarial under the current
@@ -110,17 +138,26 @@ STATE_FILE="$CWD/.claude/state.json"
 # (no realpath spawn — this is on the every-commit hot path). When
 # $CLAUDE_PROJECT_DIR is unset (legitimate: harness tests, some launch
 # modes) the check is skipped entirely so behavior is UNCHANGED.
-# Compare with separators NORMALIZED (\ → /): on Windows the payload
-# .cwd arrives BACKSLASH form while $CLAUDE_PROJECT_DIR is exported
-# forward-slash — the raw compare never matched, silent-skipping EVERY
-# real fire for ~10 weeks (0 emits in 2530 dispatches, 2026-05-17..
-# 2026-07-26; T146c/T146d regression-lock). Filesystem ops below keep
-# the original $CWD (msys accepts both forms).
+# Separator normalization (\ → /) + case-fold apply ONLY under msys/cygwin:
+# on Windows the payload .cwd arrives BACKSLASH form while
+# $CLAUDE_PROJECT_DIR is exported forward-slash — the raw compare never
+# matched, silent-skipping EVERY real fire for ~10 weeks (0 emits in 2530
+# dispatches, 2026-05-17..2026-07-26; T146c/T146d regression-lock). On
+# POSIX the compare is RAW (cff15ee follow-up 3, spec §3.3): \ is a legal,
+# literal filename byte there, so normalizing unconditionally would fold a
+# directory literally named `proj\evil` into `proj/evil` and let it slip
+# past the trusted-root prefix check below. Filesystem ops below keep the
+# original $CWD (msys accepts both forms).
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
-    CWD_CMP="${CWD//\\//}"; ROOT_CMP="${CLAUDE_PROJECT_DIR//\\//}"
+    case "$OSTYPE" in
+        msys*|cygwin*)
+            CWD_CMP="${CWD//\\//}"; ROOT_CMP="${CLAUDE_PROJECT_DIR//\\//}"
+            CWD_CMP="${CWD_CMP,,}"; ROOT_CMP="${ROOT_CMP,,}" ;;  # NTFS is case-insensitive (spec §3.1)
+        *)  CWD_CMP="$CWD"; ROOT_CMP="$CLAUDE_PROJECT_DIR" ;;  # POSIX: raw, case-sensitive, no separator folding
+    esac
     case "${CWD_CMP%/}" in
-        "${ROOT_CMP%/}"|"${ROOT_CMP%/}"/*) ;;  # in-root → proceed (normal case)
-        *) exit 0 ;;                           # escapes trusted root → silent-skip
+        "${ROOT_CMP%/}"|"${ROOT_CMP%/}"/*) ;;  # in-root → proceed
+        *) _guard_skip "state-track-commit.sh" ;;  # escapes trusted root → deduped stderr breadcrumb + guard_skip telemetry
     esac
 fi
 
@@ -156,7 +193,8 @@ fi
 # Repeat-nudge prevention: same session + same commit = don't re-emit
 NUDGE_FILE=""
 if [ -n "$SESSION_ID" ]; then
-    NUDGE_FILE="${TMPDIR:-/tmp}/.claude-state-track-${SESSION_ID}"
+    harness_tmp
+    NUDGE_FILE="${HARNESS_TMP:-${TMPDIR:-/tmp}}/.claude-state-track-${SESSION_ID}"
     LAST_NUDGED=$(cat "$NUDGE_FILE" 2>/dev/null)
     [ "$LAST_NUDGED" = "$LATEST_COMMIT" ] && exit 0
 fi

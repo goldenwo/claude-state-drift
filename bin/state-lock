@@ -9,7 +9,9 @@ writes themselves did not — two parallel Claude sessions running
 Lock-file path:
    POSIX:   ${TMPDIR}/.claude-state-locks-<uid>/.claude-state-lock-<sha1[:12]>
             per-uid dir @ 0700 + O_NOFOLLOW open (Sec P2-D / Phase O #74)
-   Windows: ${TMPDIR}/.claude-state-lock-<sha1[:12]>  (per-user %TEMP%)
+   Windows: ${TMPDIR}/.claude-harness/.claude-state-lock-<sha1[:12]>
+            scoped dir only to keep the shared temp root sweepable
+            (per-user %TEMP% — no uid suffix, no mode checks needed)
    - Per-project (different projects don't block each other)
    - Stable across sessions (sha1 of canonical path)
    - Lives in TMPDIR so cleanup is automatic on reboot
@@ -24,6 +26,10 @@ Modes:
    state-lock try-acquire <project> [--timeout S]
        Print "ACQUIRED" + exit 0 if obtainable within timeout; otherwise
        "BUSY" + exit 1. Intended for tests + ad-hoc debugging.
+   state-lock --test
+       Self-test for the lock-DIRECTORY resolution (see run_tests). The
+       locking backends themselves are covered functionally by
+       bin/focus-check-test's Section 18 parallel-write fixtures.
    state-lock --help
 
 Flags:
@@ -179,14 +185,123 @@ def _posix_lock_dir() -> Path:
     return d
 
 
+def _is_link_like(path) -> bool:
+    """True if `path` is a symlink OR any other reparse point (NTFS junction).
+
+    `Path.is_symlink()` / `os.path.islink()` are NOT sufficient on Windows:
+    they return False for a junction (`mklink /J`), which is precisely the
+    link type that matters here. `mklink /D` — a real directory symlink,
+    which islink() does catch — needs admin or Developer Mode; `mklink /J`
+    needs neither, so an islink()-only guard covers the case that mostly
+    cannot happen and misses the one that can. Measured on Windows 11
+    against a junction at `%TEMP%\\.claude-harness`:
+
+        bash [ -L ]              -> true   (harness_tmp REFUSES -> fallback)
+        Path.is_symlink()        -> False  (a lock dir guard would ACCEPT)
+        st_file_attributes       -> 0x410  (FILE_ATTRIBUTE_REPARSE_POINT set)
+
+    `st_file_attributes` exists only on Windows os.stat_result, hence the
+    getattr; `stat.FILE_ATTRIBUTE_REPARSE_POINT` is a plain constant in
+    CPython's pure-Python stat.py and is defined on every platform. A path
+    that cannot be lstat'd at all is reported as not-link-like — the caller
+    then tries mkdir and falls back on failure, which is the same outcome.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, "st_file_attributes", 0)
+                & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _win_lock_dir() -> Path:
+    """Windows: nest lock files in the toolkit's scoped temp dir.
+
+    Unlike POSIX (whose per-uid dir above exists for SECURITY), this one
+    exists for COST. The win32 branch wrote flat into %TEMP%, so every lock
+    file joined the shared-temp-root litter that session-start-orient.sh had
+    to sweep — measured at 4.196s across an 88,527-entry temp dir on the box
+    that surfaced this, 195 of those files being locks. Nesting them under
+    the same `.claude-harness` directory hooks/_tmpdir.sh resolves to (no uid
+    suffix on Windows — %TEMP% is already per-user under the profile) lets
+    that sweep be scoped instead.
+
+    No mode/ownership verification, matching lock_path_for's existing win32
+    reasoning: per-user %TEMP% has no co-located-attacker surface. Falls back
+    to the temp root when the directory can't be created, so a lock is never
+    lost to a housekeeping optimization.
+
+    Refuses a symlink OR a junction at the path (`_is_link_like`, which is
+    why `Path.is_symlink()` alone is not enough — see its docstring) for the
+    same reason hooks/_tmpdir.sh does: not as a Windows threat model, but so
+    the WRITER and the SWEEPER cannot disagree about where locks live.
+    harness_tmp's `[ -L ]` treats a junction as a link, rejects the scoped
+    dir and falls back to the root; if this accepted one, locks would sit a
+    level down where the scoped sweep no longer runs (it is skipped under
+    fallback) and the legacy root globs — `-maxdepth 1` at the root — no
+    longer match. `cmd_with` never unlinks a LOCK FILE by design (#63/#74 —
+    only the #76 reentrancy sidecar is cleared on release), so those files
+    would accumulate unswept FOREVER, silently inverting the change. Raised
+    in round 3; the junction hole found in round 6 and reproduced end-to-end,
+    since the two sides genuinely diverged. The agreement between this check
+    and harness_tmp's IS the invariant — L8/L8b in run_tests() ask both sides
+    the same question about the SAME directory (a shared tmp_root, pinned on
+    both sides by construction) and fail on disagreement. That is a
+    LINK-VERDICT invariant, not a claim that bash's `${TMPDIR:-/tmp}` and
+    Python's `tempfile.gettempdir()` pick the same root UNPROMPTED: they do
+    whenever `TMPDIR` itself is unset (this box's ordinary shape, where
+    git-bash mounts `/tmp` at `%TEMP%`), but an explicit `TMPDIR` pointing at
+    a path git-bash translates and Python does not (e.g. `TMPDIR=/tmp` —
+    bash resolves it through its mount table, Python treats it as a literal
+    Windows-relative path) would make the two ROOTS diverge — pre-existing,
+    outside what this invariant covers, and unaffected by anything L8/L8b
+    assert (they pin one shared root on purpose, on both sides, precisely so
+    root divergence cannot masquerade as a link-verdict disagreement).
+
+    Re-checked after mkdir, because the pre-check is a TOCTOU window
+    (harness_tmp re-verifies for the same reason). Neither check can be
+    individually pinned by a REAL fixture: for every fixture built from
+    actual files/links, deleting either check alone still leaves the OTHER
+    to independently reach the same final verdict (measured, not assumed) —
+    the two are redundant on the RETURN VALUE, by construction, for anything
+    this module can plant on disk. L9/L10 in run_tests() pin each anyway, via
+    a stubbed `_is_link_like` that scripts a different answer per call: L9
+    asserts the pre-check's own side effect (nothing is created on disk when
+    it fires — the return-value redundancy above is exactly why only a side
+    effect CAN distinguish it) and L10 simulates the TOCTOU race
+    deterministically (not link-like when the pre-check asks, link-like by
+    the time the post-check asks) rather than needing to win a real one.
+
+    Migration boundary: this path move is not transitional. A session running
+    a pre-change copy of this file locks `%TEMP%\\.claude-state-lock-<sha>`
+    while a post-change one locks `%TEMP%\\.claude-harness\\.claude-state-lock-<sha>`,
+    so during an upgrade the two do not mutually exclude for the same project.
+    Same boundary Phase O #74 accepted when it moved the POSIX path into a
+    per-uid dir; the exposure is one upgrade window, and dual-locking both
+    paths forever would be a permanent cost for a transient risk.
+    """
+    root = Path(tempfile.gettempdir())
+    d = root / ".claude-harness"
+    if _is_link_like(d):
+        return root
+    try:
+        d.mkdir(exist_ok=True)
+    except OSError:
+        return root
+    return d if d.is_dir() and not _is_link_like(d) else root
+
+
 def lock_path_for(project_dir: Path) -> Path:
     """Deterministic lock-file path keyed by project absolute path."""
     canon = str(project_dir.resolve()).encode("utf-8")
     digest = hashlib.sha1(canon).hexdigest()[:12]
     if sys.platform == "win32":
         # Windows %TEMP% is per-user under the profile — no shared-/tmp
-        # threat and no O_NOFOLLOW. Behaviour unchanged from #63.
-        return Path(tempfile.gettempdir()) / f".claude-state-lock-{digest}"
+        # threat and no O_NOFOLLOW. Locking behaviour unchanged from #63;
+        # only the containing directory moved (see _win_lock_dir).
+        return _win_lock_dir() / f".claude-state-lock-{digest}"
     return _posix_lock_dir() / f".claude-state-lock-{digest}"
 
 
@@ -386,11 +501,20 @@ def _sentinel_path(lock_file: Path) -> Path:
     fd, position-independent), so an in-file write there is harmless and
     matches the spec literally. On Windows we therefore leave the locked
     file's bytes 100% untouched (the #63/#74 lock path is byte-identical)
-    and put the advisory sentinel in `<lockfile>.owner`. That name still
-    matches the `.claude-state-lock-*` cleanup glob in
-    session-start-orient.sh (the `*` covers the `.owner` suffix) — no new
-    litter class. The sentinel is advisory only; the OS lock stays
-    authoritative.
+    and put the advisory sentinel in `<lockfile>.owner`. It lands beside the
+    lock file wherever THAT lands. When `_win_lock_dir` succeeds, that is
+    inside the scoped `.claude-harness` dir, which session-start-orient.sh's
+    pass 1 sweeps wholesale (a blanket `.claude-*` glob) — reclaimed on the
+    same >7-day schedule with no new litter class and no glob to keep in
+    sync. Under `_win_lock_dir`'s FALLBACK (scoped dir unavailable — see its
+    docstring), both the lock file and this sidecar land at the shared temp
+    root instead, where reclaiming the sidecar again depends on pass 3's
+    legacy `.claude-state-lock-*` name-list entry matching the `.owner`
+    suffix (it does — the trailing `*` covers it, same as before the scoped
+    dir existed) — so "no glob to keep in sync" is a scoped-path-only
+    guarantee, not an unconditional one; under fallback there is exactly the
+    one glob there always was. The sentinel is advisory only; the OS lock
+    stays authoritative.
     """
     return lock_file.with_name(lock_file.name + ".owner")
 
@@ -601,11 +725,11 @@ def cmd_with(project: str, inner_cmd: list[str], timeout: float,
         # the lock for this project — a correctness violation. So we do
         # NOT unlink. The lock files (~12 bytes each, one per distinct
         # project ever locked) are swept by hooks/session-start-orient.sh's
-        # >7-day cleanup glob — Phase R #7 added `.claude-state-lock-*`
-        # (flat, Windows) and Phase O #74 added the POSIX per-uid subdir
-        # `.claude-state-locks-<uid>/.claude-state-lock-*` to that glob.
-        # DO NOT re-add unlink here without switching to fcntl.lockf
-        # semantics.
+        # >7-day cleanup. Both platforms now nest them one level down —
+        # Windows in `.claude-harness/` (scoped-tmpdir change) and POSIX in
+        # `.claude-state-locks-<uid>/` (Phase O #74) — so that sweep reaches
+        # them by directory, not by a root-level glob. DO NOT re-add unlink
+        # here without switching to fcntl.lockf semantics.
 
 
 def cmd_try_acquire(project: str, timeout: float,
@@ -643,10 +767,368 @@ def cmd_try_acquire(project: str, timeout: float,
     return 0
 
 
+# --------------------------------------------------------------------------
+# Self-test
+# --------------------------------------------------------------------------
+
+def run_tests() -> int:
+    """Cover the lock-DIRECTORY resolution — the half with no coverage.
+
+    Section 18 of bin/focus-check-test already exercises the locking
+    backends functionally (parallel writers, BUSY, reentrancy). What had
+    none was `_win_lock_dir`, and a round-6 reviewer found a real defect
+    there on its first adversarial pass: `Path.is_symlink()` does not see an
+    NTFS junction, so Python accepted a scoped dir that hooks/_tmpdir.sh's
+    `[ -L ]` refuses — writer and sweeper disagreeing about where locks
+    live, which (locks are never unlinked, by design) accumulates forever.
+
+    L8 is the case that matters most: it asks BOTH sides the same question
+    about the same directory and fails if they answer differently. The
+    agreement is the invariant; either side alone can be self-consistently
+    wrong.
+    """
+    import shutil
+
+    passed = failed = skipped = 0
+
+    def check(desc, cond):
+        nonlocal passed, failed
+        if cond:
+            passed += 1
+            print("  PASS: %s" % desc)
+        else:
+            failed += 1
+            print("  FAIL: %s" % desc)
+
+    def skip(desc):
+        nonlocal skipped
+        skipped += 1
+        print("  SKIP: %s" % desc)
+
+    print("=== state-lock self-test ===")
+
+    root = tempfile.mkdtemp(prefix="state-lock-test-")
+    junctions = []          # removed with os.rmdir, NEVER shutil.rmtree: a
+                            # junction is not a symlink to CPython, so rmtree
+                            # would recurse through it and delete the TARGET.
+    saved_tempdir = tempfile.tempdir
+
+    def make_symlink(link, target):
+        """A REAL symlink, or None. Windows needs privilege for os.symlink and
+        git-bash `ln -s` silently copies (#79), so this legitimately fails.
+
+        Verified with os.path.islink, NEVER with _is_link_like: a fixture
+        builder that calls the function under test can DISABLE the tests
+        instead of failing them. Measured — with _is_link_like stubbed to
+        `return False`, the earlier version turned L2/L5/L8b into SKIPs and
+        the suite reported 0 failures on Linux."""
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return None
+        return link if os.path.islink(link) else None
+
+    def make_junction(link, target):
+        """An NTFS junction, or None. `mklink /J` needs no admin (unlike
+        `mklink /D`), which is exactly why it is the link type that matters."""
+        if sys.platform != "win32":
+            return None
+        try:
+            rc = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).returncode
+        except OSError:
+            return None
+        if rc != 0 or not os.path.isdir(link):
+            return None
+        junctions.append(link)
+        return link
+
+    def win_lock_dir_under(tmp_root):
+        """`_win_lock_dir()` as resolved against `tmp_root`. tempfile.tempdir
+        is the documented override for gettempdir() and is what this reads."""
+        tempfile.tempdir = tmp_root
+        try:
+            return _win_lock_dir()
+        finally:
+            tempfile.tempdir = saved_tempdir
+
+    try:
+        # -- L1: a plain directory and a plain file are not link-like. The
+        # inverse guard: without it every assertion below could pass because
+        # _is_link_like became `return True`.
+        plain_dir = os.path.join(root, "plain-dir")
+        os.mkdir(plain_dir)
+        plain_file = os.path.join(root, "plain-file")
+        with open(plain_file, "w") as fh:
+            fh.write("x")
+        check("L1 plain directory and plain file are not link-like",
+              not _is_link_like(plain_dir) and not _is_link_like(plain_file))
+
+        # -- L2: a real symlink IS link-like. Carries the guard's teeth on
+        # POSIX (where os.symlink works); L3 carries them on Windows.
+        l2 = make_symlink(os.path.join(root, "l2-link"), plain_dir)
+        if l2:
+            check("L2 symlink is link-like", _is_link_like(l2))
+        else:
+            skip("L2 (symlink) — no real symlink available on this platform")
+
+        # -- L3 (Windows-only): an NTFS JUNCTION is link-like. This is the
+        # round-6 blocker in unit form: Path.is_symlink() answers False here,
+        # which is what let a junctioned scoped dir through.
+        l3 = make_junction(os.path.join(root, "l3-junction"), plain_dir)
+        if l3:
+            check("L3 NTFS junction is link-like "
+                  "(Path.is_symlink() says False — the round-6 hole)",
+                  _is_link_like(l3) and not Path(l3).is_symlink())
+        elif sys.platform == "win32":
+            skip("L3 (junction) — mklink /J unavailable")
+        else:
+            skip("L3 (junction) — Windows-only")
+
+        # -- L4: the happy path. A clean temp root gets `.claude-harness`
+        # created and returned, and the basename matches what
+        # hooks/_tmpdir.sh builds on Windows (no uid suffix).
+        l4_root = os.path.join(root, "l4")
+        os.mkdir(l4_root)
+        got4 = win_lock_dir_under(l4_root)
+        check("L4 clean temp root yields <root>/.claude-harness",
+              str(got4) == os.path.join(l4_root, ".claude-harness")
+              and got4.is_dir())
+
+        # -- L5: a symlink AT the scoped-dir path falls back to the root.
+        l5_root = os.path.join(root, "l5")
+        os.makedirs(os.path.join(l5_root, "target"))
+        if make_symlink(os.path.join(l5_root, ".claude-harness"),
+                        os.path.join(l5_root, "target")):
+            check("L5 symlinked scoped dir falls back to the temp root",
+                  str(win_lock_dir_under(l5_root)) == l5_root)
+        else:
+            skip("L5 (symlinked scoped dir) — no real symlink available")
+
+        # -- L6 (Windows-only): a JUNCTION at the scoped-dir path falls back
+        # to the root. THE blocker, end to end. Before the fix this returned
+        # the junction, so locks landed inside the target — where pass 3's
+        # `-maxdepth 1` root globs cannot reach and pass 1 never runs
+        # (harness_tmp has already fallen back), i.e. unswept forever.
+        l6_root = os.path.join(root, "l6")
+        os.makedirs(os.path.join(l6_root, "target"))
+        if make_junction(os.path.join(l6_root, ".claude-harness"),
+                         os.path.join(l6_root, "target")):
+            got6 = win_lock_dir_under(l6_root)
+            check("L6 junctioned scoped dir falls back to the temp root",
+                  str(got6) == l6_root)
+            # End-to-end, the way it was reproduced: resolve a real lock path
+            # and touch it. Pre-fix the file appeared in the junction TARGET,
+            # which no sweep pass can see.
+            tempfile.tempdir = l6_root
+            try:
+                lock6 = lock_path_for(Path(l6_root))
+            finally:
+                tempfile.tempdir = saved_tempdir
+            lock6.write_text("x", encoding="utf-8")
+            check("L6b the lock file lands at the temp root, not inside the "
+                  "junction target",
+                  str(lock6.parent) == l6_root
+                  and os.listdir(os.path.join(l6_root, "target")) == [])
+        elif sys.platform == "win32":
+            skip("L6 (junctioned scoped dir) — mklink /J unavailable")
+            skip("L6b (junction target stays empty) — mklink /J unavailable")
+        else:
+            skip("L6 (junctioned scoped dir) — Windows-only")
+            skip("L6b (junction target stays empty) — Windows-only")
+
+        # -- L7: a regular FILE at the scoped-dir path makes mkdir impossible;
+        # the contract is "a lock is never lost to a housekeeping
+        # optimization", so fall back rather than raise.
+        l7_root = os.path.join(root, "l7")
+        os.mkdir(l7_root)
+        with open(os.path.join(l7_root, ".claude-harness"), "w") as fh:
+            fh.write("x")
+        check("L7 regular file at the scoped-dir path falls back to the root",
+              str(win_lock_dir_under(l7_root)) == l7_root)
+
+        # -- L8: WRITER/SWEEPER AGREEMENT — the actual invariant. Ask
+        # hooks/_tmpdir.sh's harness_tmp and _win_lock_dir the same question
+        # about the same directory; they must reach the same verdict. Either
+        # side alone can be self-consistently wrong: before the fix, bash
+        # refused a junction and Python accepted it, and BOTH looked correct
+        # in isolation.
+        bash_exe = shutil.which("bash")
+        tmpdir_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "hooks", "_tmpdir.sh")
+        tmpdir_sh = os.path.normpath(tmpdir_sh)
+
+        def bash_run(tmp_root, tail):
+            """Run `tail` with hooks/_tmpdir.sh sourced and TMPDIR=tmp_root.
+            The root is handed over in msys form so git-bash's test builtins
+            parse it the same way this process does."""
+            if not (bash_exe and os.path.isfile(tmpdir_sh)):
+                return None
+            arg = tmp_root
+            if sys.platform == "win32" and len(arg) > 2 and arg[1] == ":":
+                arg = "/" + arg[0].lower() + arg[2:].replace("\\", "/")
+            script = ('. "$1" || exit 9\nexport TMPDIR="$2"\nharness_tmp\n'
+                      + tail)
+            try:
+                out = subprocess.run([bash_exe, "-c", script, "_",
+                                      tmpdir_sh, arg],
+                                     capture_output=True, text=True)
+            except OSError:
+                return None
+            return out.stdout.strip()
+
+        def bash_verdict(tmp_root):
+            """'scoped' or 'fallback' per harness_tmp, or None if unavailable.
+            harness_tmp sets HARNESS_TMP="${TMPDIR:-/tmp}" verbatim on
+            fallback, so comparing against the passed root is exact — no path
+            normalization to get wrong."""
+            v = bash_run(tmp_root,
+                         'case "${HARNESS_TMP:-${TMPDIR:-/tmp}}" in '
+                         '"$2") echo fallback ;;'
+                         ' *) echo scoped ;; esac\n')
+            return v if v in ("scoped", "fallback") else None
+
+        def py_verdict(tmp_root):
+            return ("fallback" if str(win_lock_dir_under(tmp_root)) == tmp_root
+                    else "scoped")
+
+        # Which basename does harness_tmp build? ASKED, not derived: the
+        # POSIX/Windows split keys on OSTYPE inside THAT shell, not on
+        # sys.platform in this process, and a WSL bash on a Windows box would
+        # answer differently from git-bash. `_win_lock_dir` always uses
+        # `.claude-harness` (no uid suffix — %TEMP% is per-user), so on
+        # Windows the two names are THE SAME PATH, which is the entire point
+        # of the invariant; on POSIX they differ and both must be planted, or
+        # each side inspects a different directory and "agrees" for no reason.
+        l8_probe = os.path.join(root, "l8-probe")
+        os.mkdir(l8_probe)
+        bash_name = bash_run(l8_probe, 'printf "%s" "${HARNESS_TMP##*/}"\n')
+        if bash_name in (None, "", "l8-probe"):
+            bash_name = None
+
+        l8_clean = os.path.join(root, "l8-clean")
+        os.mkdir(l8_clean)
+        b_clean = bash_verdict(l8_clean)
+        if b_clean is None:
+            skip("L8 (writer/sweeper agreement, clean root) — bash or "
+                 "hooks/_tmpdir.sh unavailable")
+        else:
+            # The inverse guard, deliberately weak: it says only that neither
+            # side refuses an ordinary directory. L8b is the leg with teeth.
+            check("L8 clean root: harness_tmp and _win_lock_dir both accept "
+                  "(both '%s')" % b_clean, b_clean == py_verdict(l8_clean)
+                  and b_clean == "scoped")
+
+        # The link-planted side — the one that actually failed. A link is
+        # planted at EVERY name either side resolves (on Windows that is one
+        # name; on POSIX, two), so both are answering about a link-like entry
+        # at the path they themselves use. Prefer a junction where it exists:
+        # it is Windows' unprivileged link type and the one that regressed.
+        l8_link = os.path.join(root, "l8-link")
+        target8 = os.path.join(l8_link, "target")
+        os.makedirs(target8)
+        names8 = [".claude-harness"] + ([bash_name] if bash_name
+                                        and bash_name != ".claude-harness"
+                                        else [])
+        planted8 = [n for n in names8
+                    if (make_junction(os.path.join(l8_link, n), target8)
+                        or make_symlink(os.path.join(l8_link, n), target8))]
+        b_link = (bash_verdict(l8_link)
+                  if bash_name and len(planted8) == len(names8) else None)
+        if b_link is None:
+            skip("L8b (writer/sweeper agreement, link planted) — no link "
+                 "type or no bash available")
+        else:
+            check("L8b link planted at %s: harness_tmp and _win_lock_dir "
+                  "agree (both '%s', expected fallback)"
+                  % ("/".join(names8), b_link),
+                  b_link == py_verdict(l8_link) and b_link == "fallback")
+
+        # -- L9/L10 (round-7 N6): neither _is_link_like call in
+        # _win_lock_dir was individually pinned. For every fixture built
+        # from REAL files/links (L1-L8b above), deleting either check ALONE
+        # still returns the correct verdict, because the OTHER check
+        # independently re-derives it — the two are redundant on the RETURN
+        # VALUE, by construction, for anything plantable on disk (measured:
+        # deleting only the pre-check leaves Windows 8/0/2 green). The only
+        # way to attribute each check its OWN effect is white-box: stub
+        # _is_link_like and observe CONTROL FLOW, not just the final
+        # verdict. orig_is_link_like is saved once and restored after each
+        # of L9 and L10 individually (never left patched into L1-L8b above,
+        # which already ran, nor into anything below).
+        orig_is_link_like = _is_link_like
+
+        # L9 pins the PRE-check: stub _is_link_like to unconditionally
+        # report "link-like" against a scoped-dir path that does not exist
+        # yet, and assert nothing gets created there. With the pre-check
+        # present, that stubbed verdict short-circuits before mkdir is ever
+        # attempted. Delete the pre-check and the stubbed verdict does not
+        # arrive until the POST-check position — after mkdir has already
+        # run and created a real directory — which the post-check then
+        # correctly papers over into the same "fallback" return value; this
+        # test catches the side effect the return value alone cannot show.
+        l9_root = os.path.join(root, "l9")
+        os.mkdir(l9_root)
+        try:
+            globals()["_is_link_like"] = lambda _p: True
+            got9 = win_lock_dir_under(l9_root)
+            scoped9 = os.path.join(l9_root, ".claude-harness")
+            check("L9 pre-mkdir check refuses a link-like path BEFORE "
+                  "attempting mkdir (nothing created on disk)",
+                  str(got9) == l9_root and not os.path.lexists(scoped9))
+        finally:
+            globals()["_is_link_like"] = orig_is_link_like
+
+        # L10 pins the POST-check: script _is_link_like to answer "not
+        # link-like" on its first call (the pre-check — so it does NOT
+        # short-circuit; mkdir proceeds and creates a real, plain
+        # directory) and "link-like" on every call after (the post-check),
+        # simulating a path that turns link-like in the TOCTOU window
+        # between the two checks — the exact race the docstring says is
+        # deliberately untested because "reaching it requires winning a
+        # real race". A stub does not need to win one: it scripts the
+        # answer deterministically. Delete the post-check's _is_link_like
+        # call and this returns the (now real, plain, and wrongly-trusted)
+        # directory instead of the correct fallback.
+        l10_root = os.path.join(root, "l10")
+        os.mkdir(l10_root)
+        l10_calls = []
+
+        def _l10_stub(_p):
+            l10_calls.append(1)
+            return len(l10_calls) > 1
+
+        try:
+            globals()["_is_link_like"] = _l10_stub
+            got10 = win_lock_dir_under(l10_root)
+            check("L10 post-mkdir check catches a path that turns "
+                  "link-like AFTER the pre-check already passed it",
+                  str(got10) == l10_root)
+        finally:
+            globals()["_is_link_like"] = orig_is_link_like
+    finally:
+        tempfile.tempdir = saved_tempdir
+        for j in junctions:
+            try:
+                os.rmdir(j)
+            except OSError:
+                pass
+        shutil.rmtree(root, ignore_errors=True)
+
+    summary = "%d passed, %d failed" % (passed, failed)
+    if skipped:
+        summary += ", %d skipped" % skipped
+    print("\nstate-lock self-test: %s" % summary)
+    return 1 if failed else 0
+
+
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("--help", "-h"):
         print(__doc__)
         return 0
+    if argv[0] == "--test":
+        return run_tests()
 
     mode = argv[0]
     args = argv[1:]

@@ -481,7 +481,7 @@ def render_stats(root) -> str:
             f"  Commit nudges:       {a['commit_nudges']}",
             f"  Staleness nudges:    {a['staleness_nudges']}"]
     c = s["cost"]
-    out += ["", "Cost (~tokens, ctx_bytes/4 estimate):"]
+    out += ["", "Cost (~tokens, ctx_bytes/3.8 estimate):"]
     if c["orientation"]:
         o = c["orientation"]
         out.append(f"  Orientation: ~{o['p50_tokens']} p50 / ~{o['p95_tokens']} p95  (once per session)")
