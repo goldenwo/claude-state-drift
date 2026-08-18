@@ -70,20 +70,35 @@ edit the strings, and you have a valid starting point:
 }
 ```
 
-## Per-project hook knobs — `.claude/hooks-config.json`
+## Hook knobs — `hooks-config.json` (project and user level)
 
-Optional. A per-project JSON file that overrides the knobs of the shipped hooks.
-Unknown keys are ignored; a missing file means every hook uses its built-in default.
+Optional. A JSON file that overrides the knobs of the shipped hooks, read from
+two places:
+
+- **Project level:** `.claude/hooks-config.json` at the project root.
+- **User level:** `~/.claude/hooks-config.json` (or
+  `$CLAUDE_CONFIG_DIR/hooks-config.json` when that variable is set) — one file
+  for every project on the machine.
+
+Unknown keys are ignored; a missing file means the next layer applies.
 
 | Key | Type | Default | Env override | Controls |
 |-----|------|---------|--------------|----------|
 | `focus_check_every` | integer ≥ 1 | `6` | `FOCUS_CHECK_EVERY` | How often (in user prompts) `focus-check` re-injects the objective. |
 | `focus_check_disable` | boolean | `false` | `FOCUS_CHECK_DISABLE=1` | Disable the `focus-check` hook entirely. |
 | `state_track_pattern` | string (regex) | *(see below)* | `STATE_TRACK_PATTERN` | Commit-subject keyword regex (extended POSIX ERE) that makes `state-track-commit` suggest a state update. The built-in default matches subjects containing `ship`/`shipped`/`release`/`released`/`complete`/`completed`/`done`/`finish`/`finished`/`deliver`/`delivered`, or a version tag like `v1.2`. |
+| `handoff_nudge_tokens` | integer ≥ 1 | *(none — off)* | `STATE_HANDOFF_NUDGE_TOKENS` | **Arms** the handoff nudge's transcript-size token fallback and sets its threshold. Deliberately no default — see the note in the handoffs section. `150000` ≈ the old 200K-window behavior; `750000` for 1M windows. Setting this at user level is the intended way to opt in machine-wide. |
+| `handoff_nudge_pct` | integer ≥ 1 | `75` | `STATE_HANDOFF_NUDGE_PCT` | The handoff nudge's exact-% threshold (used when a session-status file provides the real context %). |
+| `handoff_nudge_disable` | boolean | `false` | `STATE_HANDOFF_NUDGE_DISABLE=1` | Disable the handoff-pressure nudge only. |
 
-Precedence per knob: the hook's environment variable (if set) wins, then this file,
-then the hook's built-in default. (`STATE_TRACK_DISABLE=1` also exists, env-only,
-to turn off `state-track-commit` entirely.)
+Precedence per knob: the hook's environment variable **if set** (even set-empty —
+a set variable owns its knob), then the project file, then the user-level file,
+then the built-in default. The merge is per key, so a project file that sets only
+one knob still inherits the rest from the user level — and a project can override
+a user-level value in either direction (e.g. `"handoff_nudge_disable": false`
+re-enables the nudge in one repo against a user-level `true`).
+(`STATE_TRACK_DISABLE=1` also exists, env-only, to turn off
+`state-track-commit` entirely.)
 
 ## Session handoffs — `.claude/handoffs/`
 
@@ -107,7 +122,21 @@ first), or a newer handoff lands, orientation renders plain again. The rendered 
 is truncated at the last complete line before 6 KB and always appears inside an
 explicit untrusted-content boundary — briefing data, not instructions.
 
-**Nudge knobs (env-only):** `STATE_HANDOFF_NUDGE_PCT` (default `75`, exact-%
-threshold), `STATE_HANDOFF_NUDGE_TOKENS` (default `150000`, transcript-size fallback
-threshold), `STATE_HANDOFF_NUDGE_DISABLE=1` (turn the nudge off). The nudge lives in
-the `focus-check` hook, so `FOCUS_CHECK_DISABLE=1` disables it as well.
+**Nudge knobs:** `STATE_HANDOFF_NUDGE_PCT` (default `75`, exact-% threshold),
+`STATE_HANDOFF_NUDGE_TOKENS` (no default — unset means the transcript-size
+fallback is off), `STATE_HANDOFF_NUDGE_DISABLE=1` (turn the nudge off). Each has
+a `hooks-config.json` twin (`handoff_nudge_pct` / `handoff_nudge_tokens` /
+`handoff_nudge_disable` — see the hook-knobs section above), settable per project
+or once machine-wide in `~/.claude/hooks-config.json`; a set env var still wins.
+The nudge lives in the `focus-check` hook, so `FOCUS_CHECK_DISABLE=1` disables it
+as well.
+
+**Why the token fallback is opt-in:** the exact-% path knows the real context-window
+size, but a `UserPromptSubmit` hook otherwise cannot learn it — neither the hook input
+nor the transcript records the window, and model identity doesn't determine it (the
+same model runs 200K and 1M windows). An absolute-token default calibrated to a 200K
+window fires ~5x early on a 1M-window session, so the fallback only arms when you set
+the threshold yourself — `handoff_nudge_tokens` in `~/.claude/hooks-config.json`
+(machine-wide) or `.claude/hooks-config.json` (per project), or the
+`STATE_HANDOFF_NUDGE_TOKENS` env var (e.g. `150000` for 200K-window sessions — the
+old default — or `750000` for 1M).

@@ -11,8 +11,19 @@ file per knob:
       "focus_check_disable": false,    # bool   — disable focus-check.sh
       "lint_timeout_seconds": 15,      # int  ≥1 — lint-after-write.sh (#37)
       "stop_test_timeout_seconds": 60, # int  ≥1 — stop-runs-tests.sh (#37)
-      "state_track_pattern": "ship|release|cut" # str — state-track-commit.sh
-    }                                  #            transition-keyword regex (#29)
+      "state_track_pattern": "ship|release|cut", # str — state-track-commit.sh
+                                       #            transition-keyword regex (#29)
+      "handoff_nudge_tokens": 150000,  # int  ≥1 — ARM the handoff nudge's
+                                       #            transcript-size fallback (no
+                                       #            built-in default; 2026-08-17)
+      "handoff_nudge_pct": 75,         # int  ≥1 — handoff nudge exact-% threshold
+      "handoff_nudge_disable": false   # bool   — disable the handoff nudge
+    }
+
+The same schema is read from TWO files by hooks/_hooks_config.sh: the
+per-project `.claude/hooks-config.json` and the user-level
+`${CLAUDE_CONFIG_DIR:-~/.claude}/hooks-config.json` (per-key, project
+wins). This reader stays single-file; the layering lives in the caller.
 
 Unknown keys are ignored. Precedence is decided by the CALLER, not here:
 the hook checks its env var first (if set, that wins, byte-unchanged),
@@ -140,6 +151,15 @@ _SCHEMA = {
     "focus_check_disable": _strict_bool,
     "lint_timeout_seconds": _pos_int,
     "stop_test_timeout_seconds": _pos_int,
+    # Handoff-pressure nudge knobs (2026-08-17) — the file-layer form of
+    # the STATE_HANDOFF_NUDGE_* env family read by focus-check.sh.
+    # handoff_nudge_tokens ARMS the transcript-size fallback (it has no
+    # built-in default by design — see the f0a3724 misfire note in
+    # focus-check.sh); handoff_nudge_pct tunes the exact-% threshold
+    # (default 75); handoff_nudge_disable turns the nudge off.
+    "handoff_nudge_tokens": _pos_int,
+    "handoff_nudge_pct": _pos_int,
+    "handoff_nudge_disable": _strict_bool,
     # #29 — per-project deliverable-transition keyword regex for
     # state-track-commit.sh (env STATE_TRACK_PATTERN > this > built-in
     # default). A non-empty, control-char-free string; regex *validity*

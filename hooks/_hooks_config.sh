@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# _hooks_config.sh — sourceable helper that reads ONE typed knob from a
-# project's `.claude/hooks-config.json` (ROADMAP #28's unified override
-# file), folding the four-hook config-read idiom into two functions.
+# _hooks_config.sh — sourceable helper that reads ONE typed knob from the
+# `hooks-config.json` layers (ROADMAP #28's unified override file):
+# project `.claude/hooks-config.json` first, then the user-level
+# ${CLAUDE_CONFIG_DIR:-~/.claude}/hooks-config.json (2026-08-17), folding
+# the four-hook config-read idiom into two functions.
 #
 # DRY mini-wave (v0.3.4-dev): the idiom
 #     [ -f .claude/hooks-config.json ]  →  lazy source _python.sh  →
@@ -12,9 +14,9 @@
 # Top level is FUNCTION DEFINITIONS ONLY (plus the guarded --test block),
 # so `source`-ing this file never forks a subprocess — it stays cheap on
 # the UserPromptSubmit / PostToolUse(Bash) hot paths. The load-bearing
-# perf invariant is the stat-first guard below: a caller whose project
-# has NO hooks-config.json pays exactly one `[ -f ]` stat — no _python.sh
-# source, no interpreter probe, no reader spawn.
+# perf invariant is the stat-first guard below: a caller with NEITHER a
+# project nor a user-level hooks-config.json pays exactly two `[ -f ]`
+# stats — no _python.sh source, no interpreter probe, no reader spawn.
 #
 # Usage from a hook:
 #     source "$(dirname "$0")/_hooks_config.sh"
@@ -60,12 +62,10 @@ case "${BASH_SOURCE[0]}" in
     *)  _HC_DIR="${PWD}" ;;                         # bare filename (cwd)
 esac
 
-# Shared plumbing: stat-first (hot-path invariant) → lazy python → reader.
-# Echoes the raw reader value and returns its rc; prints nothing / non-zero
-# on absent-file / no-python / reader-failure. The two public functions add
-# the type-specific validation on top. Underscore-prefixed: private to this
-# file (callers use _read_hook_config_int / _read_hook_config_str).
-_hc_read_raw() {
+# Single-file read: stat-first → lazy python → reader. Echoes the raw
+# reader value and returns its rc; prints nothing / non-zero on
+# absent-file / no-python / reader-failure.
+_hc_read_file() {
     local cfg="$1" key="$2"
     # 1. Stat first — the load-bearing perf invariant. A no-config caller
     #    pays only this stat (no _python.sh source, no python spawn).
@@ -84,6 +84,33 @@ _hc_read_raw() {
     #    reader-validated value for the key.
     local v
     v=$("$PYTHON_BIN" "$_HC_DIR/../bin/read-hooks-config" "$cfg" "$key" 2>/dev/null) || return 1
+    printf '%s\n' "$v"
+}
+
+# Shared plumbing with the two-layer resolution (2026-08-17): per KEY, the
+# project file the caller passed is tried first; when it yields no usable
+# value (absent file, absent key, wrong type, malformed JSON, no python),
+# the USER-LEVEL file ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks-config.json
+# is tried — plugin-owned machine-wide defaults without hand-editing
+# ~/.claude/settings.json env blocks. Precedence per knob is therefore
+# env (in the callers) > project file > user file > built-in default.
+# Perf invariant, restated for two layers: a caller whose project has
+# NEITHER file pays exactly two [ -f ] stats — no _python.sh source, no
+# interpreter probe, no reader spawn. The user path is resolved from the
+# environment at call time (pure parameter expansion, fork-free), which is
+# also what lets test suites isolate it via CLAUDE_CONFIG_DIR.
+# The two public functions add type-specific validation on top.
+_hc_read_raw() {
+    local cfg="$1" key="$2" v ucfg
+    if v=$(_hc_read_file "$cfg" "$key"); then
+        printf '%s\n' "$v"
+        return 0
+    fi
+    ucfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks-config.json"
+    # Same path both layers (a project rooted at $HOME hands us the user
+    # file as its "project" file) → nothing new to read.
+    [ "$ucfg" = "$cfg" ] && return 1
+    v=$(_hc_read_file "$ucfg" "$key") || return 1
     printf '%s\n' "$v"
 }
 
@@ -133,9 +160,19 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ] && [ "${1:-}" = "--test" ]; then
     _hct_tmp="$(mktemp -d)"
     trap 'rm -rf "$_hct_tmp"' EXIT
     _hct_cfg="$_hct_tmp/hooks-config.json"
+    # Two-layer isolation (user-level fallback, 2026-08-17): point the
+    # user-layer resolution at a dir inside the fixture tree so a REAL
+    # ~/.claude/hooks-config.json on the dev machine can never leak into
+    # P1-P6 (which assume no user layer) and P7+ can plant one
+    # deterministically. _hc_read_raw resolves the path from the
+    # environment at call time, so a plain assignment suffices.
+    CLAUDE_CONFIG_DIR="$_hct_tmp/user-claude"
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+    _hct_ucfg="$CLAUDE_CONFIG_DIR/hooks-config.json"
 
-    # P1: absent config → both functions return non-zero, print nothing,
-    # and (the perf invariant) do NOT source _python.sh. Run in a subshell
+    # P1: NEITHER layer present → both functions return non-zero, print
+    # nothing, and (the perf invariant) do NOT source _python.sh: the
+    # no-config caller pays only the two [ -f ] stats. Run in a subshell
     # with PYTHON_BIN/ensure_python unset so we can assert no python probe.
     if ( unset PYTHON_BIN
          out=$(_read_hook_config_int "$_hct_cfg" lint_timeout_seconds)
@@ -192,6 +229,84 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ] && [ "${1:-}" = "--test" ]; then
         _hct_bad "P6: absent key wrongly returned a value (got '$out')"
     else
         _hct_ok "P6: absent key → non-zero, caller default"
+    fi
+
+    # ─── User-level fallback layer (2026-08-17) ─────────────────────────────
+    # Per-key precedence: project .claude/hooks-config.json > user-level
+    # ${CLAUDE_CONFIG_DIR:-~/.claude}/hooks-config.json > caller default.
+    # (Env vars sit above both, but that layer lives in the CALLERS.)
+
+    # P7: no project file → a key resolves from the USER-LEVEL file.
+    rm -f "$_hct_cfg"
+    printf '%s' '{"lint_timeout_seconds":31}' > "$_hct_ucfg"
+    if out=$(_read_hook_config_int "$_hct_cfg" lint_timeout_seconds) \
+       && [ "$out" = "31" ]; then
+        _hct_ok "P7: user-level file supplies the knob (31)"
+    else
+        _hct_bad "P7: user-level fallback missing (got '${out:-}')"
+    fi
+
+    # P8: both layers define the key → PROJECT wins.
+    printf '%s' '{"lint_timeout_seconds":42}' > "$_hct_cfg"
+    if out=$(_read_hook_config_int "$_hct_cfg" lint_timeout_seconds) \
+       && [ "$out" = "42" ]; then
+        _hct_ok "P8: project value shadows user value (42 over 31)"
+    else
+        _hct_bad "P8: project did not shadow user (got '${out:-}')"
+    fi
+
+    # P9: per-KEY merge, not per-file shadowing — a project file that
+    # exists but LACKS the key still falls through to the user layer for
+    # that key, while the keys it does define stay project-sourced.
+    printf '%s' '{"focus_check_every":2}' > "$_hct_cfg"
+    if out=$(_read_hook_config_int "$_hct_cfg" lint_timeout_seconds) \
+       && [ "$out" = "31" ]; then
+        _hct_ok "P9: key absent from project file falls to user layer (31)"
+    else
+        _hct_bad "P9: per-key merge broken (got '${out:-}')"
+    fi
+    if out=$(_read_hook_config_int "$_hct_cfg" focus_check_every) \
+       && [ "$out" = "2" ]; then
+        _hct_ok "P9b: key present in project file stays project-sourced (2)"
+    else
+        _hct_bad "P9b: project-present key misresolved (got '${out:-}')"
+    fi
+
+    # P10: a project `false` SHADOWS a user `true` for a bool knob (the
+    # re-enable-locally case): rc 0 with "0", never the user's "1". A
+    # wrong user-wins or first-truthy merge would flip this.
+    printf '%s' '{"focus_check_disable":false}' > "$_hct_cfg"
+    printf '%s' '{"focus_check_disable":true}' > "$_hct_ucfg"
+    if out=$(_read_hook_config_str "$_hct_cfg" focus_check_disable) \
+       && [ "$out" = "0" ]; then
+        _hct_ok "P10: project false shadows user true (\"0\")"
+    else
+        _hct_bad "P10: bool shadowing broken (got '${out:-}')"
+    fi
+
+    # P11: the handoff-nudge knobs are in the reader schema with the right
+    # types (int/int/bool), resolvable from the user layer — the knob
+    # family this fallback exists for (plugin-owned config instead of env
+    # in ~/.claude/settings.json).
+    rm -f "$_hct_cfg"
+    printf '%s' '{"handoff_nudge_tokens":150000,"handoff_nudge_pct":80,"handoff_nudge_disable":true}' > "$_hct_ucfg"
+    if out=$(_read_hook_config_int "$_hct_cfg" handoff_nudge_tokens) \
+       && [ "$out" = "150000" ]; then
+        _hct_ok "P11: handoff_nudge_tokens int knob (150000)"
+    else
+        _hct_bad "P11: handoff_nudge_tokens not readable (got '${out:-}')"
+    fi
+    if out=$(_read_hook_config_int "$_hct_cfg" handoff_nudge_pct) \
+       && [ "$out" = "80" ]; then
+        _hct_ok "P11b: handoff_nudge_pct int knob (80)"
+    else
+        _hct_bad "P11b: handoff_nudge_pct not readable (got '${out:-}')"
+    fi
+    if out=$(_read_hook_config_str "$_hct_cfg" handoff_nudge_disable) \
+       && [ "$out" = "1" ]; then
+        _hct_ok "P11c: handoff_nudge_disable bool knob (\"1\")"
+    else
+        _hct_bad "P11c: handoff_nudge_disable not readable (got '${out:-}')"
     fi
 
     echo "=== _hooks_config.sh self-test: $_hct_pass passed, $_hct_fail failed ==="

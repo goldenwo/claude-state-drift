@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml"><img src="https://github.com/goldenwo/claude-state-drift/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.4.2-blue" alt="version"></a>
+  <a href="https://github.com/goldenwo/claude-state-drift/releases"><img src="https://img.shields.io/badge/version-v0.4.3-blue" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/runs%20in-Claude%20Code%20%C2%B7%20Copilot%20CLI%20%C2%B7%20Codex%20CLI-8A63D2" alt="runs in Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI">
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="platform">
@@ -130,11 +130,18 @@ flowchart LR
    rendered as clearly-marked untrusted briefing data, and superseded automatically
    the moment `state.json` is updated again or a newer handoff lands. When a
    session's context use crosses a threshold (75% when the exact figure is
-   available locally, else a ~150k-token estimate from the transcript size), the
-   prompt hook injects a one-line suggestion to compose one — at most once per
-   session, never on the same prompt as the focus re-injection.
-   `STATE_HANDOFF_NUDGE_DISABLE=1` turns the nudge off;
-   `STATE_HANDOFF_NUDGE_PCT` / `STATE_HANDOFF_NUDGE_TOKENS` tune the thresholds.
+   available locally), the prompt hook injects a one-line suggestion to compose
+   one — at most once per session, never on the same prompt as the focus
+   re-injection. When the exact figure isn't available, a transcript-size token
+   estimate can stand in, but only if you arm it yourself: the hook can't learn
+   your context-window size, and an absolute default tuned for 200K windows fires
+   far too early on 1M-window sessions. Set `handoff_nudge_tokens` once in
+   `~/.claude/hooks-config.json` (machine-wide, plugin-owned config — `150000`
+   ≈ 200K windows, `750000` ≈ 1M) or per project in `.claude/hooks-config.json`;
+   the `STATE_HANDOFF_NUDGE_TOKENS` env var still works and wins when set.
+   `handoff_nudge_disable` turns the nudge off and `handoff_nudge_pct` tunes the
+   exact-% threshold, same two files, same `STATE_HANDOFF_NUDGE_*` env overrides
+   (see [SCHEMA.md](SCHEMA.md)).
 5. **Honest scope note.** That periodic re-surfacing rides on your prompts, so it's
    *interactive-only*: a headless run with no user turns — `claude -p`, an
    autonomously-driven SDK loop, CI — gets the one-time session-start orientation and
@@ -201,9 +208,9 @@ Two things keep it bounded:
 - The orientation block scales with what *you* put in `state.json` — a
   one-sentence `current_focus` keeps it near the low end. You're in control.
 
-Tune or disable the per-prompt focus check per project in `.claude/hooks-config.json`
-(see [SCHEMA.md](SCHEMA.md)); the session-end staleness nudge has its own
-`STATE_STALENESS_*` environment switches. Nothing is measured remotely: the optional
+Tune or disable the per-prompt focus check per project in `.claude/hooks-config.json`,
+or machine-wide in `~/.claude/hooks-config.json` (see [SCHEMA.md](SCHEMA.md)); the
+session-end staleness nudge has its own `STATE_STALENESS_*` environment switches. Nothing is measured remotely: the optional
 `CLAUDE_HOOK_LOG=1` writes a local `.claude/.hook-log.jsonl` and nothing leaves
 your machine. For scale, that per-session cost is in the same range as a lean
 project `CLAUDE.md`, and a small fraction of what one MCP server's tool
@@ -317,7 +324,15 @@ session while the plugin is enabled — just ask Claude to run them:
   (the plugin stays silent rather than nagging) or the file is invalid — ask Claude
   to run `state-validate` (bundled, on the Bash `PATH` while the plugin is enabled).
 - **Focus-check fires too often / not often enough?** Set the cadence in
-  `.claude/hooks-config.json` — see [SCHEMA.md](SCHEMA.md).
+  `.claude/hooks-config.json` (per project) or `~/.claude/hooks-config.json`
+  (machine-wide) — see [SCHEMA.md](SCHEMA.md).
+- **Handoff nudge never fires?** Without a local session-status integration the
+  hook has no exact context %, and the transcript-size fallback is off until you
+  arm it — it has no safe default because the hook can't know your context-window
+  size. Set `handoff_nudge_tokens` in `~/.claude/hooks-config.json`: `150000`
+  nudges around 75% of a 200K window, `750000` around 75% of 1M. If it fires too
+  early or too late, your sessions are probably running a different window than
+  the value assumes — re-arm with the matching number.
 - **Does anything leave my machine?** No. All signals are computed from local files
   and local git; there is no network access, and nothing is sent anywhere.
 

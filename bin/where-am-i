@@ -50,6 +50,7 @@ from pathlib import Path
 from _state_lib import (  # noqa: E402
     compute_lag_days,
     compute_stats,
+    history_lag,
     history_path,
     normalize_version,
     read_history,
@@ -408,6 +409,21 @@ def render(state: dict, root: Path) -> str:
     if stale is not None:
         days, commits_ahead = stale
         lines.append(f"⚠ stale by {days}d, {commits_ahead} commits ahead")
+
+    # Companion cross-check to the staleness line: a status_changed_at newer
+    # than the newest state-history.jsonl transition means a session moved a
+    # deliverable without `state-history append` (the 2026-08-16-diagnosed
+    # silent-gap failure mode, which zeroes the --stats joins). Deliverable
+    # ids already render raw throughout this block; the hook's defang wraps it.
+    lag = history_lag(root, state)
+    if lag is not None:
+        last = lag["last_history_ts"] or "(no transition records)"
+        lines.append(
+            f"⚠ history lag: {lag['deliverable_id']} status changed "
+            f"{lag['status_changed_at']} but the newest state-history "
+            f"transition is {last} — append the missed transition(s) via "
+            f"`state-history append`"
+        )
 
     # #68 (baseline F22): cross-ref auto-memory entries whose Title topic shows
     # up in objective/current_focus. Cheap silent-skip (no line) when the

@@ -20,8 +20,25 @@
 #                                    this hook and exits with it)
 #   STATE_HANDOFF_NUDGE_DISABLE=1  — disable only the handoff-pressure nudge
 #   STATE_HANDOFF_NUDGE_PCT=N      — nudge threshold, exact-% path (default 75)
-#   STATE_HANDOFF_NUDGE_TOKENS=N   — nudge threshold, token-estimate fallback
-#                                    (default 150000)
+#   STATE_HANDOFF_NUDGE_TOKENS=N   — nudge threshold, token-estimate fallback.
+#                                    NO DEFAULT: unset (or non-numeric) =
+#                                    fallback off. The hook cannot learn the
+#                                    context-window size, so any built-in
+#                                    absolute default misfires on large windows
+#                                    (the old 150000 fired at ~15% of a 1M
+#                                    session) — set it only if you know your
+#                                    sessions' window. Exact-% path unaffected.
+#
+# Configuration via file (#28, user layer 2026-08-17): every knob above has
+# a hooks-config.json twin (focus_check_every, focus_check_disable,
+# handoff_nudge_disable, handoff_nudge_pct, handoff_nudge_tokens), read per
+# key from the project `.claude/hooks-config.json`, then the user-level
+# `${CLAUDE_CONFIG_DIR:-~/.claude}/hooks-config.json`. Precedence per knob:
+# env if SET (even empty/junk — a set env var owns the knob) > project file
+# > user file > built-in. A file-set handoff_nudge_tokens ARMS the token
+# fallback exactly like the env var — the plugin-owned opt-in that doesn't
+# require editing ~/.claude/settings.json (150000 ≈ the old 200K-window
+# behavior, 750000 for 1M windows).
 #
 # This is the spec-review-loop's Reflexion-style re-anchor pattern, scoped
 # to general work instead of review rounds. UserPromptSubmit is the right
@@ -98,24 +115,32 @@ else
     [ -f "${STATE_FILE}" ] || exit 0
 fi
 
-# #28 file-layer (audit F6) — apply per-project .claude/hooks-config.json
-# overrides for any knob the env var did NOT set. Placement: AFTER the
+# #28 file-layer (audit F6) — apply hooks-config.json overrides for any
+# knob the env var did NOT set. TWO layers since 2026-08-17: the
+# per-project file, then the user-level
+# ${CLAUDE_CONFIG_DIR:-~/.claude}/hooks-config.json (per key, project
+# wins — the merge lives in _hooks_config.sh). Placement: AFTER the
 # state.json existence gate (uninstrumented repos already exited above,
-# paying zero cost) and gated on a single `[ -f ]` stat for the config
-# file. The overwhelmingly common case is "state.json exists, no
-# hooks-config.json" → one cheap stat, NO python/jq spawn, then fall
-# through unchanged. Only a repo that actually ships the override file
+# paying zero cost) and gated on one `[ -f ]` stat per layer. The
+# overwhelmingly common case is "state.json exists, no hooks-config
+# anywhere" → two cheap stats, NO python/jq spawn, then fall through
+# unchanged. Only a repo/machine that actually ships an override file
 # pays the reader subprocess. Precedence: env (already resolved above) >
-# file (here) > built-in default (already in EVERY). Malformed / absent /
-# bad-type → reader exits non-zero → we keep the current value silently
-# (no crash, no stderr — the strongest #28 acceptance criterion).
+# project file > user file > built-in default (already in EVERY).
+# Malformed / absent / bad-type → reader exits non-zero → we keep the
+# current value silently (no crash, no stderr — the strongest #28
+# acceptance criterion). HAVE_HOOKS_CONFIG also gates the nudge knobs'
+# file reads further down, so the no-config path never re-stats.
 HOOKS_CONFIG="${CWD}/.claude/hooks-config.json"
-if [ -f "$HOOKS_CONFIG" ]; then
+HAVE_HOOKS_CONFIG=0
+if [ -f "$HOOKS_CONFIG" ] || [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks-config.json" ]; then
+    HAVE_HOOKS_CONFIG=1
     # Shared config-read helper (function-only → sourcing never forks).
-    # Sourced lazily HERE, inside the `[ -f ]` guard, so the no-config hot
-    # path pays only the single stat above and never even sources this
-    # helper. _hooks_config.sh lazily sources _python.sh itself (its
-    # stat-first plumbing preserves the no-spawn-on-no-config invariant).
+    # Sourced lazily HERE, inside the either-file guard, so the no-config
+    # hot path pays only the two stats above and never even sources this
+    # helper. _hooks_config.sh lazily sources _python.sh itself, re-stats
+    # each layer internally (cheap once any file exists), and falls back
+    # project → user per key.
     # shellcheck disable=SC1091
     source "$(dirname "$0")/_hooks_config.sh"
     # focus_check_every (int): only when env did NOT set it. The helper
@@ -154,6 +179,18 @@ NUDGE_TRANSCRIPT_PATH="${_SID_TP#*$'\t'}"
 # transcript-byte/4 token estimate (never renders a fabricated %). Sentinel
 # path uses a sanitized session id (never the raw value) so a hostile
 # session_id can't path-traverse the sentinel filename.
+#
+# Knob file layer (2026-08-17): each STATE_HANDOFF_NUDGE_* env var has a
+# hooks-config.json twin (handoff_nudge_disable / _pct / _tokens) with the
+# #28 precedence — env if SET (even empty/junk: a set env var owns the
+# knob, cf. FOCUS_CHECK_EVERY) > project file > user file > built-in. File
+# reads are branch-scoped and lazy: HAVE_HOOKS_CONFIG=0 → zero reads;
+# post-fire prompts stop at the sentinel stat; the disable knob resolves
+# only when a nudge is ABOUT to fire (≤ once per session). Steady pre-fire
+# cost on a machine that arms the token fallback via file: one reader
+# spawn per prompt (the threshold probe) — accepted for now; fold into a
+# multi-key read if perf-bench ever flags it.
+NUDGE_DISABLE_ENV_SET="${STATE_HANDOFF_NUDGE_DISABLE+x}"
 if [ "${STATE_HANDOFF_NUDGE_DISABLE:-0}" != "1" ]; then
     NUDGE_SAFE_SID="${SESSION_ID//[^A-Za-z0-9_-]/}"
     if [ -n "$NUDGE_SAFE_SID" ]; then
@@ -173,20 +210,63 @@ if [ "${STATE_HANDOFF_NUDGE_DISABLE:-0}" != "1" ]; then
                 # dropped, never interpolated.
                 case "$NUDGE_USED_PCT" in ''|.|*[!0-9.]*|*.*.*) NUDGE_USED_PCT="" ;; esac
                 if [ -n "$NUDGE_USED_PCT" ]; then
-                    NUDGE_PCT_THRESH="${STATE_HANDOFF_NUDGE_PCT:-75}"
+                    # threshold: env if SET; else the file layer (project →
+                    # user via the helper); the numeric guard turns any
+                    # unusable result into the built-in 75.
+                    NUDGE_PCT_THRESH=""
+                    if [ -n "${STATE_HANDOFF_NUDGE_PCT+x}" ]; then
+                        NUDGE_PCT_THRESH="${STATE_HANDOFF_NUDGE_PCT}"
+                    elif [ "$HAVE_HOOKS_CONFIG" = "1" ]; then
+                        NUDGE_PCT_THRESH=$(_read_hook_config_int "$HOOKS_CONFIG" handoff_nudge_pct)
+                    fi
                     case "$NUDGE_PCT_THRESH" in ''|.|*[!0-9.]*|*.*.*) NUDGE_PCT_THRESH=75 ;; esac
                     if awk -v p="$NUDGE_USED_PCT" -v t="$NUDGE_PCT_THRESH" 'BEGIN{exit !(p+0 >= t+0)}' 2>/dev/null; then
                         NUDGE_MSG="context ~${NUDGE_USED_PCT%.*}%: consider /claude-state-drift:handoff before it gets tight"
                     fi
                 fi
             elif [ -n "$NUDGE_TRANSCRIPT_PATH" ] && [ -f "$NUDGE_TRANSCRIPT_PATH" ]; then
-                NUDGE_TBYTES=$(wc -c < "$NUDGE_TRANSCRIPT_PATH" 2>/dev/null | tr -d '[:space:]')
-                case "$NUDGE_TBYTES" in ''|*[!0-9]*) NUDGE_TBYTES=0 ;; esac
-                NUDGE_TOK=$(( NUDGE_TBYTES / 4 ))
-                NUDGE_TOK_THRESH="${STATE_HANDOFF_NUDGE_TOKENS:-150000}"
-                if [ "$NUDGE_TOK" -ge "$NUDGE_TOK_THRESH" ]; then
-                    NUDGE_MSG="context estimate ~$(( NUDGE_TOK / 1000 ))k tokens: consider /claude-state-drift:handoff before it gets tight"
+                # Token-estimate fallback — EXPLICIT OPT-IN, no built-in default,
+                # since the 2026-08-16 large-context misfire: the old default
+                # (150000 ≈ 75% of a 200K window) fired at ~15-18% of real
+                # 1M-window sessions, ~5x before the nudge's ≥75%-context
+                # covenant allows. The window is unknowable here — UserPromptSubmit
+                # stdin carries no model/window field, the transcript JSONL
+                # records no window, session-status is absent precisely when the
+                # statusline integration doesn't run, and a model→window map is
+                # no better (an observed opus session ran a 1M window). Only the
+                # operator knows the window, so only an explicit arming value —
+                # env STATE_HANDOFF_NUDGE_TOKENS, or (env unset) a
+                # handoff_nudge_tokens file knob — arms this path; the exact-%
+                # branch above (window-aware at its source) stays default-on.
+                NUDGE_TOK_THRESH=""
+                if [ -n "${STATE_HANDOFF_NUDGE_TOKENS+x}" ]; then
+                    NUDGE_TOK_THRESH="${STATE_HANDOFF_NUDGE_TOKENS}"
+                elif [ "$HAVE_HOOKS_CONFIG" = "1" ]; then
+                    NUDGE_TOK_THRESH=$(_read_hook_config_int "$HOOKS_CONFIG" handoff_nudge_tokens)
                 fi
+                # numeric guard (house idiom): malformed value behaves as unset —
+                # silent skip, never fed to the -ge compare below (which would
+                # leak an "integer expression expected" to stderr on every prompt).
+                case "$NUDGE_TOK_THRESH" in ''|*[!0-9]*) NUDGE_TOK_THRESH="" ;; esac
+                if [ -n "$NUDGE_TOK_THRESH" ]; then
+                    NUDGE_TBYTES=$(wc -c < "$NUDGE_TRANSCRIPT_PATH" 2>/dev/null | tr -d '[:space:]')
+                    case "$NUDGE_TBYTES" in ''|*[!0-9]*) NUDGE_TBYTES=0 ;; esac
+                    NUDGE_TOK=$(( NUDGE_TBYTES / 4 ))
+                    if [ "$NUDGE_TOK" -ge "$NUDGE_TOK_THRESH" ]; then
+                        NUDGE_MSG="context estimate ~$(( NUDGE_TOK / 1000 ))k tokens: consider /claude-state-drift:handoff before it gets tight"
+                    fi
+                fi
+            fi
+            # File-layer disable, resolved LAST — only when a nudge is about
+            # to fire (≤ once per session, so this read never lands on the
+            # steady hot path) and only when the env var did NOT set the
+            # knob (a set env var owns it, including an explicit =0 pinning
+            # the nudge ON against a file-level disable). A project `false`
+            # likewise re-enables against a user-level `true` — the helper
+            # returns the project's "0", shadowing the user layer.
+            if [ -n "$NUDGE_MSG" ] && [ -z "$NUDGE_DISABLE_ENV_SET" ] && [ "$HAVE_HOOKS_CONFIG" = "1" ]; then
+                _hc_nudge_disable=$(_read_hook_config_str "$HOOKS_CONFIG" handoff_nudge_disable)
+                [ "$_hc_nudge_disable" = "1" ] && NUDGE_MSG=""
             fi
             if [ -n "$NUDGE_MSG" ]; then
                 mkdir -p "$NUDGE_SENT_DIR" 2>/dev/null

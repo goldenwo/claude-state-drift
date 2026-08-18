@@ -421,7 +421,11 @@ def append_event(root, event_type, verdict=None, ts=None, session_id=None):
 
 
 def read_history(root, deliverable_id=None):
-    """Read .claude/state-history.jsonl, newest record last (file order).
+    """Read .claude/state-history.jsonl in file order.
+
+    File order is usually append order, NOT guaranteed ts order — backfilled
+    records (appended later with an older --ts) break monotonicity, so
+    callers needing recency must compare ts values, not positions.
 
     Returns a list of record dicts. Malformed or blank lines are skipped
     SILENTLY — a single corrupt line must never crash a reader of an
@@ -448,6 +452,68 @@ def read_history(root, deliverable_id=None):
             continue
         records.append(rec)
     return records
+
+
+# Slack allowed between a deliverable's status_changed_at and the newest
+# transition record before history_lag flags. In the compliant flow the
+# append follows the state.json edit within the same apply (seconds), and
+# drafting order can put status_changed_at slightly after the append's ts;
+# an hour absorbs both, while a real skipped append surfaces at the next
+# session start (the observed gaps run days to weeks).
+HISTORY_LAG_TOLERANCE_S = 3600
+
+
+def history_lag(root, state):
+    """Return the newest transition the history log missed, or None.
+
+    Cross-check for the silent-gap failure mode (diagnosed 2026-08-16: 19
+    days of deliverable transitions, zero appends): a session edits
+    state.json and sets status_changed_at but never runs
+    `state-history append`, which silently zeroes the conversion and
+    staleness-resolution joins in compute_stats. Compares the newest
+    deliverables[].status_changed_at against the newest TRANSITION record
+    ts (event records don't count — they log no transition) and returns
+    {"deliverable_id", "status_changed_at", "last_history_ts"} when the
+    former is more than HISTORY_LAG_TOLERANCE_S newer. last_history_ts is
+    None when the log holds no parseable transition records at all.
+
+    Returns None (no finding) when the log file is absent — the project
+    hasn't opted into the audit log, and warning every session would be
+    noise — or when nothing parses, or when the log is current.
+    """
+    if not history_path(root).is_file():
+        return None
+    raw = state.get("deliverables", [])
+    if not isinstance(raw, list):
+        return None
+    newest = None  # (parsed_dt, deliverable_id, raw_status_changed_at)
+    for d in raw:
+        if not isinstance(d, dict):
+            continue
+        dt = parse_iso(d.get("status_changed_at"))
+        if dt is None:
+            continue
+        if newest is None or dt > newest[0]:
+            newest = (dt, d.get("id", "?"), d.get("status_changed_at"))
+    if newest is None:
+        return None
+    last_dt = last_ts = None
+    for rec in read_history(root):
+        if "deliverable_id" not in rec:
+            continue
+        dt = parse_iso(rec.get("ts"))
+        if dt is None:
+            continue
+        if last_dt is None or dt > last_dt:
+            last_dt, last_ts = dt, rec.get("ts")
+    if (last_dt is not None
+            and (newest[0] - last_dt).total_seconds() <= HISTORY_LAG_TOLERANCE_S):
+        return None
+    return {
+        "deliverable_id": newest[1],
+        "status_changed_at": newest[2],
+        "last_history_ts": last_ts,
+    }
 
 
 # --- observability stats (csd-observability-stats) -------------------------
@@ -997,6 +1063,73 @@ def run_tests():
     except Exception as e:  # noqa: BLE001
         check(f"S4 --staleness CLI parse-failure sentinel "
               f"({type(e).__name__}: {e})", False)
+
+    # --- history_lag: the state-history silent-gap cross-check ----------
+    def _hl_fixture(tmp, records, deliverables):
+        """Build a root with .claude/state-history.jsonl (records=None -> no
+        file) and return (root, state) ready for history_lag."""
+        root = Path(tmp)
+        (root / ".claude").mkdir(parents=True, exist_ok=True)
+        if records is not None:
+            lines = "".join(
+                json.dumps(r, separators=(",", ":")) + "\n" for r in records)
+            (root / ".claude" / HISTORY_FILENAME).write_text(
+                lines, encoding="utf-8")
+        return root, {"deliverables": deliverables}
+
+    _tr = {"deliverable_id": "d1", "from": "none", "to": "done",
+           "ts": "2026-08-01T00:00:00Z", "session_id": "s"}
+    _ev = {"event": "re-anchor", "verdict": "mild",
+           "ts": "2026-08-15T00:00:00Z", "session_id": "s"}
+    _dl = [{"id": "d2", "status": "done",
+            "status_changed_at": "2026-08-10T12:00:00Z"}]
+    try:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            root, st = _hl_fixture(tmp_s, None, _dl)
+            check("H1 history_lag: absent log file -> None (opt-in "
+                  "semantics; a project without the audit log never warns)",
+                  history_lag(root, st) is None)
+        with tempfile.TemporaryDirectory() as tmp_s:
+            root, st = _hl_fixture(tmp_s, [_tr], _dl)
+            got = history_lag(root, st)
+            check("H2 history_lag: status_changed_at 9d newer than the last "
+                  "transition record -> flags that deliverable + both ts",
+                  got == {"deliverable_id": "d2",
+                          "status_changed_at": "2026-08-10T12:00:00Z",
+                          "last_history_ts": "2026-08-01T00:00:00Z"})
+        with tempfile.TemporaryDirectory() as tmp_s:
+            root, st = _hl_fixture(
+                tmp_s, [dict(_tr, ts="2026-08-10T12:00:30Z")], _dl)
+            check("H3 history_lag: append 30s before status_changed_at "
+                  "(same apply, drafting order) -> None via the tolerance",
+                  history_lag(root, st) is None)
+        with tempfile.TemporaryDirectory() as tmp_s:
+            root, st = _hl_fixture(
+                tmp_s, [dict(_tr, ts="2026-08-10T12:00:05Z")],
+                _dl + [{"id": "junk"}, "not-a-dict",
+                       {"id": "d3", "status_changed_at": "garbage"}])
+            check("H4 history_lag: current log -> None; junk deliverables "
+                  "(no/unparseable status_changed_at, non-dict) are skipped",
+                  history_lag(root, st) is None)
+        with tempfile.TemporaryDirectory() as tmp_s:
+            root, st = _hl_fixture(tmp_s, [_ev], _dl)
+            got = history_lag(root, st)
+            check("H5 history_lag: a NEWER event record does not mask a "
+                  "missed transition (events log no transition) -> flags "
+                  "with last_history_ts=None",
+                  got is not None and got["last_history_ts"] is None
+                  and got["deliverable_id"] == "d2")
+        with tempfile.TemporaryDirectory() as tmp_s:
+            root, st = _hl_fixture(
+                tmp_s, [_tr],
+                [{"id": "d4", "status_changed_at": "2026-08-12"}])
+            got = history_lag(root, st)
+            check("H6 history_lag: a bare-DATE status_changed_at (the "
+                  "hand-rolled-edit shape observed in the 08-12 gap) still "
+                  "parses and flags",
+                  got is not None and got["deliverable_id"] == "d4")
+    except Exception as e:  # noqa: BLE001
+        check(f"H1-H6 history_lag ({type(e).__name__}: {e})", False)
 
     for line in cases:
         print(line)
